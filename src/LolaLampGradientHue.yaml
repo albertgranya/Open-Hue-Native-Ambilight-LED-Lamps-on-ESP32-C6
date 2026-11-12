@@ -1,0 +1,882 @@
+# LolaLampGradientHue.yaml - Lola Lamp: 90 LEDs adrecables en 5 segments de 18, llum Hue per Zigbee (pont Philips Hue)
+# i Ambilight + Hue amb un color per segment (2026-10-11).
+#
+# - Identitat Zigbee propia (mac :0A): aparellar-la com una llum nova a l'app Hue ("Cercar"). Mateixa recepta Hue que
+#   el cactus (component huewejnorg amb hue_emulation): model LCT015, el pont l'accepta com a llum Hue de color.
+# - Mode Hue: color, brillantor i encesa de l'app a tota la tira. (El pont nomes envia degradats als models
+#   gradient; aquest perfil es d'una bombeta de color.)
+# - Ambilight: mentre la TV envia el stream de l'area d'entreteniment, cada segment pren el color de l'entrada que
+#   indiquin amb_seg1..amb_seg5 (adreca curta Zigbee d'una llum de l'area; 0x0000 = l'entrada propia de la Lola) i
+#   l'efecte "Ambilight Gradient" fa un degradat continu entre els 5 centres. La Lola rep el broadcast del proxy encara
+#   que no sigui a l'area; si hi es, la seva entrada propia es la seva zona de pantalla. 1 s sense trames: torna al
+#   color de l'app. El log "hue_ent" llista cada 10 s les adreces de l'area amb el seu color (per triar amb_segN).
+# - Finestra Wi-Fi de ${wifi_window} a cada arrencada (OTA, API), despres Zigbee.
+# Format del stream i com arriba: components/huewejnorg/hue_emu.h.
+
+substitutions:
+  name: lolalamp                      # mateix nom que el firmware antic (lolalamp.yaml): HA i OTA el reconeixen
+  friendly_name: LolaLamp
+  wifi_window: "30s"
+  # Animacio d'arrencada (lola_strip_create): la Lola "puja" com el cactus, un LED cada lola_step_ms des de la base.
+  lamp_base_led_count: "65"            # LEDs de la base (comptats des de la punta on comenca a pujar)
+  lola_grow_reverse: "true"            # true (confirmat 2026-10-12): la base es a la punta de l'ultim LED; el LED 0 es a dalt
+  lola_step_ms: "15"                   # 90 LEDs x 15 ms = 1,35 s
+  # Colors de l'arrencada (animacio lola_strip_create i escena lola_pie_luz): el peu (base) marro i la llum groga al 100 %.
+  lola_pie_color: "110, 45, 8"         # peu (els lamp_base_led_count LEDs de la base): marro
+  lola_luz_color: "255, 200, 0"        # llum (la resta): groc (255,255,0 pur tira a verd als WS2812)
+  lola_base_color: "${lola_pie_color}" # l'animacio puja ja amb els colors finals
+  lola_rest_color: "${lola_luz_color}"
+  zb_mac: "00:17:88:01:CA:FE:00:0A"   # identitat Zigbee nova (no reutilitzar: :09 es el cactus)
+  # Maquinari: el mateix que lolalamp.yaml (tira WS2812 GRB a GPIO19; LED d'estat WS2812 a GPIO8)
+  led_pin: GPIO19
+  led_count: "91"                     # com lolalamp.yaml (led_number 91)
+  led_chipset: ws2812
+  led_rgb_order: GRB
+  # Color de l'app Hue (xy -> RGB, zigbee::xy_to_rgb): gamut de la tira. xy dels tres LEDs del WS2812 (valors tipics;
+  # afina'ls comparant amb una bombeta Hue al costat) i blanc de referencia D65. Amb els primaris sRGB el rosa Hue
+  # quedava fora del gamut i sortia magenta sense blanc; i la gamma es codificava dos cops (sRGB + gamma_correct 2,8),
+  # que deixava a la meitat els canals petits, el "blanc" dels blaus clars i els roses.
+  lola_prim_r: "0.700, 0.300"
+  lola_prim_g: "0.170, 0.700"
+  lola_prim_b: "0.135, 0.060"
+  lola_rgb_gamma: "2.8"              # gamma_correct de lola_strip; xy_to_rgb codifica amb 1/gamma i el LED rep el lineal
+  lola_white_mix: "0.0"              # ajust fi a ull: 0 colorimetric; 0,1 = un 10 % de blanc a tots els colors
+  seg_leds: "23"                      # Ambilight en 4 segments de 23 LEDs (0-22, 23-45, 46-68, 69-90); el 5e queda fora
+  # Ambilight: llum de l'area que pinta cada segment. 0x0000 = entrada propia. El LED 0 es a dalt (la base es a la
+  # punta de l'ultim LED, confirmat 2026-10-12): segment 1 = dalt, per sobre de la TV; segment 5 = baix, darrere i per
+  # sota de la TV.
+  # Mapatge 2026-10-12 19:4x: l'area de la TV te ara 4 zones a la dreta, en cadena (11.000 trames de 19:33 a 19:37):
+  # Lola (propia) - "Lampara adalt" 0xF83B (r=0,81) - "Lampara mig" 0xA693 (r=0,53) - "Lampara abaix" 0x3FAB (r=0,75),
+  # i el cactus 0x0026 rep el mateix color que l'abaix. Noms llegits del pont (API local); les posicions les desa la TV.
+  # 4 segments de dalt a baix: propia, adalt, mig, abaix (el 5e, fora de la tira, repeteix l'abaix).
+  # Si l'entrada triada no hi es (llum fora de l'area o adreca canviada), el segment pren l'entrada propia.
+  amb_seg1: "0x0000"
+  amb_seg2: "0xF83B"
+  amb_seg3: "0xA693"
+  amb_seg4: "0x3FAB"
+  amb_seg5: "0x3FAB"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  comment: "Lola Lamp: 91 LEDs WS2812 (GPIO19) en 5 segments + LED estat (GPIO8), llum Hue per Zigbee + Ambilight per segments."
+  build_path: .esphome/build/lolalamp_gradient   # no barrejar amb el build de lolalamp.yaml
+  includes:
+    - coex_extern.h
+  on_boot:
+    - priority: 800
+      then:
+        - lambda: |-
+            int r = esp_coex_wifi_i154_enable();
+            ESP_LOGI("coex_early", "esp_coex_wifi_i154_enable() -> %d", r);
+        - lambda: |-
+            // Gamut de la tira per al color xy de l'app Hue (vegeu lola_prim_* a substitutions).
+            zigbee::xy_set_primaries(${lola_prim_r}, ${lola_prim_g}, ${lola_prim_b});
+            zigbee::xy_set_output(${lola_rgb_gamma}, ${lola_white_mix});
+    - priority: -100
+      then:
+        - light.turn_on:
+            id: strip_onboard_raw
+            effect: "Status"
+        - script.execute: lola_strip_create   # puja com el cactus: base blava i la resta blau clar
+        - script.execute: apply_connectivity
+
+esp32:
+  board: esp32-c6-devkitc-1
+  variant: esp32c6
+  flash_size: 4MB
+  partitions: partitions_zb.csv
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESPTOOLPY_FLASHSIZE_4MB: y
+      CONFIG_ESP_TASK_WDT_TIMEOUT_S: "25"
+      CONFIG_LOG_DYNAMIC_LEVEL_CONTROL: y
+      CONFIG_VFS_SUPPORT_SELECT: y
+      CONFIG_RMT_TX_ISR_CACHE_SAFE: y
+      # Rastreig de les penjades amb l'Ambilight: si una tasca deixa de donar senyals de vida 25 s, panic amb backtrace al
+      # port serie (per defecte nomes avisa i la placa es queda penjada sense dir res).
+      CONFIG_ESP_TASK_WDT_PANIC: y
+
+logger:
+  baud_rate: 115200
+  level: INFO
+  logs:
+    zigbee: INFO
+    esp-zboss: INFO
+    esp-zigbee: INFO
+    component: WARN
+    light: WARN
+    wifi: INFO
+    api: WARN
+    esp-idf: WARN
+    esp32_rmt_led_strip: WARN
+    button: WARN
+    partition: WARN
+    Zigbee_main: INFO
+
+api:
+  reboot_timeout: 0s
+  # Sense encryption, com lolalamp.yaml: Home Assistant ja hi esta connectat aixi.
+  actions:
+    - action: run_switch_to_wifi
+      then:
+        - script.execute: switch_to_wifi
+
+ota:
+  - platform: esphome
+    on_begin:
+      then:
+        - lambda: id(ota_active) = true;
+        - logger.log: "OTA iniciada: la finestra Wi-Fi s'allarga"
+    on_error:
+      then:
+        - lambda: id(ota_active) = false;
+        - logger.log: "OTA fallida: tanco el Wi-Fi i passo a Zigbee"
+        - script.execute: switch_to_zigbee
+
+wifi:
+  min_auth_mode: WPA2
+  networks:
+    - ssid: !secret wifi_ssid
+      password: !secret wifi_password
+      priority: 2
+    - ssid: !secret wifi_ssid_b
+      password: !secret wifi_password
+      priority: 1
+  power_save_mode: NONE
+  reboot_timeout: 0s
+  output_power: 20dB
+  on_connect:
+    - lambda: id(wifi_up) = true;
+  on_disconnect:
+    - lambda: id(wifi_up) = false;
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [huewejnorg]
+
+globals:
+  - id: wifi_up
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: ota_active
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: conn_cfg_version
+    type: int
+    restore_value: yes
+    initial_value: '0'
+  # 1 quan ja s'ha esborrat una vegada la memoria Zigbee (zb_storage) heretada del firmware antic.
+  - id: lola_zb_fresh
+    type: int
+    restore_value: yes
+    initial_value: '0'
+  - id: zb_mode
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  # Estat de la llum Hue (endpoint 11). hue_mode: 0 = HS, 1 = XY (CIE 1931), 2 = CT (mireds).
+  - id: hue_on
+    type: bool
+    restore_value: no
+    initial_value: "true"
+  - id: hue_level
+    type: float
+    restore_value: no
+    initial_value: "1.0"
+  - id: hue_mode
+    type: int
+    restore_value: no
+    initial_value: "2"
+  - id: hue_x
+    type: float
+    restore_value: no
+    initial_value: "0.3127"
+  - id: hue_y
+    type: float
+    restore_value: no
+    initial_value: "0.3290"
+  - id: hue_ct
+    type: float
+    restore_value: no
+    initial_value: "366"
+  - id: hue_h
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: hue_s
+    type: float
+    restore_value: no
+    initial_value: "0"
+  # Ambilight: color suavitzat de cada segment (r, g, b ja amb la brillantor aplicada).
+  - id: lola_create_start_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  # Degradat d'escena Hue (fins a 9 punts, r,g,b 0..1 cadascun) i serial de l'ultim aplicat.
+  - id: grad_rgb
+    type: std::array<float, 27>
+    restore_value: no
+    initial_value: "std::array<float, 27>{}"
+  - id: grad_n
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: grad_serial
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  # Escena d'arrencada: fins 15 s despres d'unir-se a la xarxa Zigbee s'ignoren els atributs Hue (la pila restaura els
+  # valors guardats / el pont reenvia l'ultim estat, que tornava a pintar el blau d'abans); despres mana l'app.
+  # Compte: on_join nomes salta en un steering nou; en rearrencar amb la xarxa guardada (DEVICE_REBOOT) no, i la
+  # retencio no es deixava anar mai (el pont veia la Lola connectada pero ignorava l'app). Per aixo switch_to_zigbee
+  # tambe engega hue_hold_release.
+  - id: hue_hold
+    type: bool
+    restore_value: no
+    initial_value: "true"
+  - id: amb_active
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: amb_rgb
+    type: std::array<float, 15>
+    restore_value: no
+    initial_value: "std::array<float, 15>{}"
+
+light:
+  # Tira sencera: la pinten el mode Hue (color pla) i l'Ambilight (efecte per segments).
+  - platform: esp32_rmt_led_strip
+    id: lola_strip
+    name: "LolaLight"                 # mateix nom que la llum del firmware antic
+    pin: ${led_pin}
+    rgb_order: ${led_rgb_order}
+    num_leds: ${led_count}
+    chipset: ${led_chipset}
+    rmt_symbols: 48
+    gamma_correct: ${lola_rgb_gamma}   # la mateixa gamma que desfa xy_to_rgb (lola_rgb_gamma)
+    default_transition_length: 400ms
+    restore_mode: ALWAYS_OFF
+    effects:
+      # Arrencada: la tira s'encen LED a LED des de la base (com "Cactus Create"); despres es queda fixa amb la base
+      # blava i la resta blau clar fins que mani l'app Hue o l'Ambilight.
+      - addressable_lambda:
+          name: "Lola Strip Create"
+          update_interval: ${lola_step_ms}ms
+          lambda: |-
+            const int N = (int) it.size();
+            const int B = ${lamp_base_led_count};
+            const uint32_t start = id(lola_create_start_ms);
+            int t = start ? (int) ((millis() - start) / ${lola_step_ms}) : N;
+            if (t > N) t = N;
+            const Color base(${lola_base_color}), rest(${lola_rest_color});
+            for (int k = 0; k < N; k++) {           // k = posicio comptada des de la base
+              const int i = ${lola_grow_reverse} ? (N - 1 - k) : k;
+              it[i] = (k < t) ? (k < B ? base : rest) : Color(0, 0, 0);
+            }
+      # Escena d'arrencada: el peu (base) marro i la llum groga. Estatica; la mana el script lola_pie_luz.
+      - addressable_lambda:
+          name: "Lola Pie Luz"
+          update_interval: 500ms
+          lambda: |-
+            const int N = (int) it.size();
+            const int B = ${lamp_base_led_count};
+            const Color pie(${lola_pie_color}), luz(${lola_luz_color});
+            for (int k = 0; k < N; k++) {           // k = posicio comptada des de la base
+              const int i = ${lola_grow_reverse} ? (N - 1 - k) : k;
+              it[i] = (k < B) ? pie : luz;
+            }
+      # Escena Hue amb degradat: els punts repartits de la base (punt 0) a dalt, interpolats LED a LED. La base es on
+      # comenca l'animacio (lola_grow_reverse).
+      - addressable_lambda:
+          name: "Hue Gradient"
+          update_interval: 50ms
+          lambda: |-
+            const int N = (int) it.size();
+            const int P = id(grad_n);
+            const auto &c = id(grad_rgb);
+            if (P < 1) return;
+            for (int i = 0; i < N; i++) {
+              const int k = ${lola_grow_reverse} ? (N - 1 - i) : i;   // posicio comptada des de la base
+              float pos = (P == 1 || N == 1) ? 0 : (float) k * (float) (P - 1) / (float) (N - 1);
+              int a = (int) pos;
+              if (a > P - 2) a = P - 2 < 0 ? 0 : P - 2;
+              const float t = (P == 1) ? 0 : pos - (float) a;
+              const int b2 = (P == 1) ? a : a + 1;
+              it[i] = Color((uint8_t) ((c[a * 3] * (1 - t) + c[b2 * 3] * t) * 255.0f),
+                            (uint8_t) ((c[a * 3 + 1] * (1 - t) + c[b2 * 3 + 1] * t) * 255.0f),
+                            (uint8_t) ((c[a * 3 + 2] * (1 - t) + c[b2 * 3 + 2] * t) * 255.0f));
+            }
+      # Degradat continu entre els centres dels 5 segments (colors del stream, ja suavitzats a l'interval).
+      - addressable_lambda:
+          name: "Ambilight Gradient"
+          update_interval: 16ms
+          lambda: |-
+            const int N = (int) it.size();
+            const float S = (float) ${seg_leds};
+            const auto &c = id(amb_rgb);
+            for (int i = 0; i < N; i++) {
+              float p = ((float) i + 0.5f) / S - 0.5f;        // posicio en unitats de segment (centre del 0 = 0)
+              if (p < 0) p = 0;
+              if (p > 4) p = 4;
+              int a = (int) p;
+              if (a > 3) a = 3;
+              const float t = p - (float) a;
+              const float r = c[a * 3 + 0] * (1 - t) + c[(a + 1) * 3 + 0] * t;
+              const float g = c[a * 3 + 1] * (1 - t) + c[(a + 1) * 3 + 1] * t;
+              const float b = c[a * 3 + 2] * (1 - t) + c[(a + 1) * 3 + 2] * t;
+              it[i] = Color((uint8_t) (r * 255.0f), (uint8_t) (g * 255.0f), (uint8_t) (b * 255.0f));
+            }
+      # Mateix stream amb blocs durs (un color per segment, sense degradat).
+      - addressable_lambda:
+          name: "Ambilight Segments"
+          update_interval: 16ms
+          lambda: |-
+            const int N = (int) it.size();
+            const auto &c = id(amb_rgb);
+            for (int i = 0; i < N; i++) {
+              int s = i / ${seg_leds};
+              if (s > 4) s = 4;
+              it[i] = Color((uint8_t) (c[s * 3] * 255.0f), (uint8_t) (c[s * 3 + 1] * 255.0f),
+                            (uint8_t) (c[s * 3 + 2] * 255.0f));
+            }
+
+  # LED d'estat de la placa (GPIO8), com a lolalamp.yaml: verd parpellejant = finestra Wi-Fi connectada,
+  # blau fix suau = unida a la xarxa Zigbee, vermell parpellejant = encara buscant.
+  - platform: esp32_rmt_led_strip
+    id: strip_onboard_raw
+    internal: true
+    pin: GPIO8
+    rgb_order: GRB
+    num_leds: 1
+    chipset: ws2812
+    rmt_symbols: 48
+    default_transition_length: 0s
+    effects:
+      - addressable_lambda:
+          name: "Status"
+          update_interval: 500ms
+          lambda: |-
+            const bool blink = (millis() % 1000) < 500;
+            Color c(0, 0, 0);
+            if (id(wifi_up)) c = blink ? Color(0, 64, 0) : Color(0, 0, 0);
+            else if (id(zb).is_connected()) c = Color(0, 0, 24);
+            else c = blink ? Color(64, 0, 0) : Color(0, 0, 0);
+            it.all() = c;
+
+  # Segments per control manual des de HA (durant la finestra Wi-Fi o en mode sols Wi-Fi).
+  - platform: partition
+    id: seg1
+    name: "Segment 1"
+    restore_mode: ALWAYS_OFF
+    segments:
+      - id: lola_strip
+        from: 0
+        to: 17
+  - platform: partition
+    id: seg2
+    name: "Segment 2"
+    restore_mode: ALWAYS_OFF
+    segments:
+      - id: lola_strip
+        from: 18
+        to: 35
+  - platform: partition
+    id: seg3
+    name: "Segment 3"
+    restore_mode: ALWAYS_OFF
+    segments:
+      - id: lola_strip
+        from: 36
+        to: 53
+  - platform: partition
+    id: seg4
+    name: "Segment 4"
+    restore_mode: ALWAYS_OFF
+    segments:
+      - id: lola_strip
+        from: 54
+        to: 71
+  - platform: partition
+    id: seg5
+    name: "Segment 5"
+    restore_mode: ALWAYS_OFF
+    segments:
+      - id: lola_strip
+        from: 72
+        to: 90
+
+script:
+  # Animacio d'arrencada de la Lola (tambe amb el boto "Lola Strip Create").
+  # Puja com el cactus, espera 1 s a dalt de tot i ho torna a fer (dues vegades); despres es queda encesa.
+  - id: lola_strip_create
+    mode: restart
+    then:
+      - repeat:
+          count: 2
+          then:
+            - lambda: id(lola_create_start_ms) = millis();
+            - light.turn_on:
+                id: lola_strip
+                brightness: 100%
+                effect: "Lola Strip Create"   # (ESPHome no admet effect i transition_length a la mateixa ordre)
+            - delay: !lambda "return ${led_count} * ${lola_step_ms} + 1000;"
+      - script.execute: lola_pie_luz
+
+  # Escena d'arrencada: peu marro i llum groga al 100 % (tambe amb el boto "Lola Pie Luz"). Si l'Ambilight esta actiu no
+  # toca la tira; la primera ordre de l'app Hue (hue_render) la substitueix.
+  - id: lola_pie_luz
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: "return !id(amb_active);"
+          then:
+            - lambda: 'ESP_LOGI("lola", "escena d arrencada: peu marro + llum groga al 100 %%");'
+            - light.turn_on:
+                id: lola_strip
+                brightness: 100%
+                effect: "Lola Pie Luz"
+
+  # Fi de la retencio de l'escena d'arrencada: 15 s despres d'unir-se a Zigbee (on_join) torna a manar l'app Hue.
+  - id: hue_hold_release
+    mode: restart
+    then:
+      - delay: 15s
+      - lambda: |-
+          id(hue_hold) = false;
+          ESP_LOGI("hue", "retencio de l'escena d'arrencada acabada: l'app Hue torna a manar");
+
+  # Aplica l'estat de l'endpoint Hue 11 (on/off, nivell, color en HS, XY o CT) a tota la tira.
+  - id: hue_render
+    mode: restart
+    then:
+      - lambda: |-
+          if (id(amb_active)) return;  // mentre hi ha Ambilight, la tira la pinta el stream
+          if (id(hue_hold)) {
+            ESP_LOGI("hue", "hue_render ignorat (escena d'arrencada): on=%d mode=%d level=%.2f", (int) id(hue_on), id(hue_mode), id(hue_level));
+            return;
+          }
+          ESP_LOGI("hue", "hue_render: on=%d mode=%d level=%.2f x=%.4f y=%.4f ct=%.0f h=%.3f s=%.3f", (int) id(hue_on), id(hue_mode),
+                   id(hue_level), id(hue_x), id(hue_y), id(hue_ct), id(hue_h), id(hue_s));
+          float r = 1, g = 1, b = 1;
+          if (id(hue_mode) == 1) {
+            zigbee::xy_to_rgb(id(hue_x), id(hue_y), &r, &g, &b);  // gamut de la tira (lola_prim_*), lineal al LED
+          } else if (id(hue_mode) == 2) {
+            // Mireds -> RGB (aproximacio de Tanner Helland)
+            float mired = id(hue_ct) < 153 ? 153 : (id(hue_ct) > 500 ? 500 : id(hue_ct));
+            float t = 10000.0f / mired;
+            r = t <= 66 ? 1.0f : 329.698727446f * powf(t - 60, -0.1332047592f) / 255.0f;
+            g = t <= 66 ? (99.4708025861f * logf(t) - 161.1195681661f) / 255.0f
+                        : 288.1221695283f * powf(t - 60, -0.0755148492f) / 255.0f;
+            b = t >= 66 ? 1.0f : (t <= 19 ? 0.0f : (138.5177312231f * logf(t - 10) - 305.0447927307f) / 255.0f);
+          } else {
+            float h = id(hue_h) * 6.0f, sat = id(hue_s);
+            int i = (int) h % 6;
+            float f = h - (int) h, pp = 1 - sat, q = 1 - sat * f, tt = 1 - sat * (1 - f);
+            switch (i) { case 0: r = 1; g = tt; b = pp; break; case 1: r = q; g = 1; b = pp; break;
+                         case 2: r = pp; g = 1; b = tt; break; case 3: r = pp; g = q; b = 1; break;
+                         case 4: r = tt; g = pp; b = 1; break; default: r = 1; g = pp; b = q; break; }
+          }
+          auto clamp01 = [](float v) { return v < 0 ? 0.0f : (v > 1 ? 1.0f : v); };
+          r = clamp01(r); g = clamp01(g); b = clamp01(b);
+          auto call = id(lola_strip).make_call();
+          call.set_state(id(hue_on));
+          if (id(hue_on)) {
+            call.set_effect("None");
+            call.set_brightness(id(hue_level) < 0.004f ? 0.004f : id(hue_level));
+            call.set_rgb(r, g, b);
+          }
+          call.perform();
+
+  - id: apply_connectivity
+    mode: single
+    then:
+      # Primera arrencada d'aquest firmware: esborra la memoria Zigbee heretada del firmware antic (lolalamp.yaml ja
+      # havia tingut Zigbee amb una altra identitat; amb dades velles la pila no fa steering i el pont no la troba).
+      # La pila encara no ha arrencat (manual_start), aixi que zigbee.reset nomes esborra zb_storage.
+      - if:
+          condition:
+            lambda: "return id(lola_zb_fresh) < 1;"
+          then:
+            - logger.log: "Primera arrencada amb el firmware Hue: esborro la memoria Zigbee heretada"
+            - zigbee.reset: zb
+            - lambda: id(lola_zb_fresh) = 1;
+      # Primera arrencada: mode combinat (finestra Wi-Fi i despres Zigbee).
+      - if:
+          condition:
+            lambda: "return id(conn_cfg_version) < 2;"
+          then:
+            - switch.turn_on: sw_wifi_enabled
+            - switch.turn_on: sw_zigbee_enabled
+            - lambda: id(conn_cfg_version) = 2;
+      - lambda: |-
+          ESP_LOGI("conn", "arrancada: wifi_enabled=%d zigbee_enabled=%d", id(sw_wifi_enabled).state,
+                   id(sw_zigbee_enabled).state);
+      - if:
+          condition:
+            lambda: "return id(sw_wifi_enabled).state == id(sw_zigbee_enabled).state;"
+          then:
+            - logger.log: "Mode combinat: finestra Wi-Fi -> Zigbee"
+            - script.execute: wifi_window_script
+          else:
+            - if:
+                condition:
+                  lambda: "return id(sw_wifi_enabled).state;"
+                then:
+                  - logger.log: "Mode sols Wi-Fi: Zigbee no arrencara"
+                else:
+                  - logger.log: "Mode sols Zigbee: apago el Wi-Fi i arrenco Zigbee"
+                  - script.execute: switch_to_zigbee
+
+  - id: wifi_window_script
+    mode: single
+    then:
+      # La finestra compta des que connecta (no des de l'arrencada): el router pot trigar 10-25 s a acceptar-la.
+      - wait_until:
+          condition:
+            wifi.connected:
+          timeout: 40s
+      - delay: ${wifi_window}
+      - if:
+          condition:
+            lambda: "return !id(ota_active);"
+          then:
+            - script.execute: switch_to_zigbee
+          else:
+            - logger.log: "OTA en curs: la finestra Wi-Fi segueix oberta"
+
+  - id: switch_to_zigbee
+    mode: single
+    then:
+      - logger.log: "Fi de la finestra Wi-Fi: apago el Wi-Fi i arrenco Zigbee"
+      - lambda: id(zb_mode) = true;
+      - wifi.disable:
+      - delay: 2s
+      - zigbee.start: zb
+      # Rearrencada amb xarxa guardada: on_join no salta; deixem anar la retencio igualment 15 s despres d'arrencar.
+      - script.execute: hue_hold_release
+
+  - id: switch_to_wifi
+    mode: single
+    then:
+      - logger.log: "Mode Wi-Fi: Zigbee apagat (reinici imminent)"
+      - switch.turn_on: sw_wifi_enabled
+      - switch.turn_off: sw_zigbee_enabled
+      - delay: 500ms
+      - lambda: App.safe_reboot();
+
+  - id: boot_by_wifi
+    mode: restart
+    then:
+      - switch.turn_on: sw_wifi_enabled
+      - switch.turn_off: sw_zigbee_enabled
+      - delay: 5s
+      - lambda: App.safe_reboot();
+
+  - id: boot_by_zigbee
+    mode: restart
+    then:
+      - switch.turn_off: sw_wifi_enabled
+      - switch.turn_on: sw_zigbee_enabled
+      - delay: 5s
+      - lambda: App.safe_reboot();
+
+# Rastreig de les penjades: memoria i temps de loop (debug) i, a l'interval de sota, un senyal de vida de l'Ambilight cada
+# 5 s. Amb el port serie capturat a un fitxer (tools/serial_log.py), l'ultima linia abans del silenci diu en quin estat
+# estava; i amb CONFIG_ESP_TASK_WDT_PANIC la penjada acaba en backtrace.
+debug:
+  update_interval: 10s
+
+sensor:
+  - platform: debug
+    free:
+      name: "Heap Free"
+      entity_category: diagnostic
+    block:
+      name: "Heap Max Block"
+      entity_category: diagnostic
+    loop_time:
+      name: "Loop Time"
+      entity_category: diagnostic
+
+# Motiu de l'ultim reinici (panic, watchdog, brownout...): es veu a HA i a l'API durant la finestra Wi-Fi. El backtrace
+# d'un panic l'envia el crash handler d'ESPHome al primer client que es subscriu als logs.
+text_sensor:
+  - platform: debug
+    reset_reason:
+      name: "Reset Reason"
+      entity_category: diagnostic
+
+interval:
+  - interval: 5s
+    then:
+      - lambda: |-
+          // esphome_hue_ent_diag(): 16 bits baixos = trames d'entreteniment propies rebudes (satura a 65535).
+          static uint32_t last_frames = 0;
+          uint32_t frames = esphome_hue_ent_diag() & 0xFFFF;
+          ESP_LOGI("vida", "amb=%d trames=%u (+%u en 5 s) heap=%u bloc=%u zb=%d wifi=%d", (int) id(amb_active), (unsigned) frames,
+                   (unsigned) (frames - last_frames), (unsigned) esp_get_free_heap_size(),
+                   (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_8BIT), (int) id(zb).is_connected(), (int) id(wifi_up));
+          last_frames = frames;
+  # Ambilight per segments: calcula al loop principal el color de cada segment a partir de la taula d'entrades del
+  # stream (la tasca Zigbee nomes escriu numeros). L'efecte "Ambilight Gradient" pinta la tira.
+  - interval: 33ms
+    then:
+      - lambda: |-
+          // Degradat d'escena Hue nou (component huewejnorg): el pintem amb l'efecte "Hue Gradient".
+          {
+            esphome_hue_gradient_t g;
+            esphome_hue_gradient_get(&g);
+            if (g.serial != id(grad_serial) && g.n > 0) {
+              id(grad_serial) = g.serial;
+              auto &c = id(grad_rgb);
+              const int P = g.n > 9 ? 9 : g.n;
+              for (int k = 0; k < P; k++) {
+                float r, gg, b;
+                zigbee::xy_to_rgb(g.x[k], g.y[k], &r, &gg, &b);
+                c[k * 3] = r; c[k * 3 + 1] = gg; c[k * 3 + 2] = b;
+              }
+              id(grad_n) = P;
+              ESP_LOGI("gradient", "Degradat d'escena Hue: %d punts", P);
+              if (!id(amb_active)) {
+                auto call = id(lola_strip).turn_on();
+                call.set_brightness(id(hue_level) < 0.004f ? 0.004f : id(hue_level));
+                call.set_effect("Hue Gradient");
+                call.perform();
+              }
+            }
+          }
+          static const uint16_t seg_addr[5] = {${amb_seg1}, ${amb_seg2}, ${amb_seg3}, ${amb_seg4}, ${amb_seg5}};
+          bool any = false;
+          if (esphome_hue_ent_frame_active(1000)) {
+            auto &c = id(amb_rgb);
+            const float k = 0.5f;  // suavitzat entre trames (~23 per segon)
+            for (int s = 0; s < 5; s++) {
+              float bri = 0, x = 0.3127f, y = 0.3290f;
+              if (!esphome_hue_ent_color_of(seg_addr[s], &bri, &x, &y) &&
+                  (seg_addr[s] == 0 || !esphome_hue_ent_color_of(0, &bri, &x, &y)))
+                continue;
+              any = true;
+              float r, g, b;
+              zigbee::xy_to_rgb(x, y, &r, &g, &b);
+              c[s * 3 + 0] += (r * bri - c[s * 3 + 0]) * k;
+              c[s * 3 + 1] += (g * bri - c[s * 3 + 1]) * k;
+              c[s * 3 + 2] += (b * bri - c[s * 3 + 2]) * k;
+            }
+          }
+          if (any && !id(amb_active)) {
+            id(amb_active) = true;
+            ESP_LOGI("ambilight", "Ambilight ON: 5 segments segueixen la TV");
+            auto call = id(lola_strip).turn_on();
+            call.set_brightness(1.0f);
+            call.set_transition_length(0);
+            call.set_effect("Ambilight Gradient");
+            call.perform();
+          } else if (!any && id(amb_active)) {
+            id(amb_active) = false;
+            ESP_LOGI("ambilight", "Ambilight OFF: torno al color de l'app Hue");
+            id(hue_render).execute();
+          }
+
+switch:
+  - platform: template
+    name: "WiFi enabled"
+    id: sw_wifi_enabled
+    icon: mdi:wifi
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+  - platform: template
+    name: "Zigbee enabled"
+    id: sw_zigbee_enabled
+    icon: mdi:zigbee
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+  - platform: template
+    name: "BYWIFI"
+    id: sw_by_wifi
+    icon: mdi:wifi-arrow-up-down
+    entity_category: config
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    on_turn_on:
+      - script.execute: boot_by_wifi
+  - platform: template
+    name: "BYZIGBEE"
+    id: sw_by_zigbee
+    icon: mdi:zigbee
+    entity_category: config
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    on_turn_on:
+      - script.execute: boot_by_zigbee
+
+button:
+  - platform: template
+    name: "Lola Strip Create"
+    icon: mdi:arrow-up-bold
+    on_press:
+      - script.execute: lola_strip_create
+  - platform: template
+    name: "Lola Pie Luz"
+    icon: mdi:lamp
+    on_press:
+      - script.execute: lola_pie_luz
+  - platform: template
+    name: "WiFi mode (reboot)"
+    icon: mdi:wifi-refresh
+    entity_category: config
+    on_press:
+      - script.execute: switch_to_wifi
+  - platform: template
+    name: "Zigbee Reset - Re-pair"
+    icon: mdi:zigbee
+    entity_category: diagnostic
+    on_press:
+      - logger.log: "Zigbee reset: oblido la xarxa"
+      - zigbee.reset: zb
+  - platform: restart
+    name: "Reset"
+    icon: mdi:restart
+    entity_category: diagnostic
+
+# ------------------------------ Zigbee (perfil Hue) ------------------------------
+huewejnorg:
+  id: zb
+  name: "LCT015"
+  manufacturer: "Signify Netherlands B.V."
+  manufacturer_code: 0x100B
+  zcl_version: 1
+  stack_version: 1
+  hw_version: 1
+  date: "20181120"
+  sw_build_id: "1.116.12"
+  ident_time: 0
+  mac: "${zb_mac}"
+  version: 2
+  channel: 11
+  debug: false
+  power_supply: 1
+  router: true
+  manual_start: true
+  hue_emulation: true
+  hue_endpoint: 11
+  join_mode: distributed
+  log_network_key: false
+  trust_center_key: "0x81, 0x42, 0x86, 0x86, 0x5D, 0xC1, 0xC8, 0xB2, 0xC8, 0xCB, 0xC5, 0x2E, 0x5D, 0x65, 0xD1, 0xB8"
+  on_join:
+    - then:
+        - logger.log: "Zigbee joined (Lola Lamp, perfil Hue LCT015, endpoint 11)"
+        - script.execute: hue_hold_release
+  on_recall_scene:
+    - then:
+        - lambda: |-
+            ESP_LOGI("zb_scene", "recall scene: group=%u id=%u", scene_group, scene_id);
+  endpoints:
+    - num: 11
+      device_type: EXTENDED_COLOR_LIGHT
+      clusters:
+        - id: ON_OFF
+          attributes:
+            - attribute_id: 0
+              type: bool
+              on_value:
+                then:
+                  - lambda: id(hue_on) = (bool) x;
+                  - script.execute: hue_render
+            - attribute_id: 0x4000 # GlobalSceneControl
+              type: bool
+              value: true
+            - attribute_id: 0x4001 # OnTime
+              type: U16
+              value: 0
+            - attribute_id: 0x4002 # OffWaitTime
+              type: U16
+              value: 0
+            - attribute_id: 0x4003 # StartUpOnOff (1 = on)
+              type: 8BIT_ENUM
+              value: 1
+        - id: LEVEL_CONTROL
+          attributes:
+            - attribute_id: 0
+              type: U8
+              value: 254
+              on_value:
+                then:
+                  - lambda: id(hue_level) = (float) x / 254.0f;
+                  - script.execute: hue_render
+            - attribute_id: 0x4000 # StartUpCurrentLevel
+              type: U8
+              value: 254
+        - id: COLOR_CONTROL
+          attributes:
+            - attribute_id: 0x0000 # CurrentHue
+              type: U8
+              value: 0
+              on_value:
+                then:
+                  - lambda: |-
+                      id(hue_h) = (float) x / 254.0f;
+                      id(hue_mode) = 0;
+                  - script.execute: hue_render
+            - attribute_id: 0x0001 # CurrentSaturation
+              type: U8
+              value: 0
+              on_value:
+                then:
+                  - lambda: |-
+                      id(hue_s) = (float) x / 254.0f;
+                      id(hue_mode) = 0;
+                  - script.execute: hue_render
+            - attribute_id: 0x0003 # CurrentX
+              type: U16
+              value: 20493
+              on_value:
+                then:
+                  - lambda: |-
+                      id(hue_x) = (float) x / 65536.0f;
+                      id(hue_mode) = 1;
+                  - script.execute: hue_render
+            - attribute_id: 0x0004 # CurrentY
+              type: U16
+              value: 21561
+              on_value:
+                then:
+                  - lambda: |-
+                      id(hue_y) = (float) x / 65536.0f;
+                      id(hue_mode) = 1;
+                  - script.execute: hue_render
+            - attribute_id: 0x0007 # ColorTemperatureMireds
+              type: U16
+              value: 366
+              on_value:
+                then:
+                  - lambda: |-
+                      id(hue_ct) = (float) x;
+                      id(hue_mode) = 2;
+                  - script.execute: hue_render
+            - attribute_id: 0x0008 # ColorMode (0 HS, 1 XY, 2 CT)
+              type: 8BIT_ENUM
+              value: 2
+            - attribute_id: 0x4001 # EnhancedColorMode
+              type: 8BIT_ENUM
+              value: 2
+            - attribute_id: 0x400A # ColorCapabilities: HS | EnhancedHue | ColorLoop | XY | CT
+              type: 16BITMAP
+              value: 0x001F
+            - attribute_id: 0x400B # ColorTempPhysicalMinMireds (6500 K)
+              type: U16
+              value: 153
+            - attribute_id: 0x400C # ColorTempPhysicalMaxMireds (2000 K)
+              type: U16
+              value: 500
+            - attribute_id: 0x4010 # StartUpColorTemperatureMireds
+              type: U16
+              value: 366

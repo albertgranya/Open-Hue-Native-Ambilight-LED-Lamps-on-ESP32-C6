@@ -1,0 +1,2040 @@
+# cactus_ambilight.yaml - cactushue.yaml + mode AMBILIGHT (Hue Entertainment, 2026-10-11). Vegeu components/huewejnorg/hue_emu.h.
+# Mentre la TV (Ambilight + Hue) envia el stream de l'area d'entreteniment, el cos del cactus (planta = tronc + bracos)
+# pren el color de la seva entrada (adreca curta del cactus) i el pot el color antagonic. 1 s sense trames -> torna a
+# l'estat Hue. Un efecte llancat des de HA talla l'Ambilight fins que acaba la sessio. El component compta per quin
+# cami arriba el stream (log "hue_ent": unicast si som proxy, Inter-PAN pel handler raw o pel hook APS).
+# Mateix 'name' que cactushue.yaml (mateix dispositiu, OTA i build).
+
+substitutions:
+  wifi_window: "30s"   # finestra WiFi/API/OTA a cada arrencada (mode combinat); s allarga mentre hi ha una OTA
+  # Duracio d'un step de l'animacio en milisegons. Animacio total = 52 * step_ms.
+  step_ms: "15"
+  # Canal Zigbee del Hue Bridge. Substitucio nomes accepta int (les llistes
+  # YAML no funcionen via substitucions). Per escaneig multi-canal, editar
+  # la linia 'channel:' directament (veure comentari sota huewejnorg:).
+  hue_channel: "20"
+  light_A_led_number: "58"
+  light_A_leds_tronc: "43"
+  light_A_leds_tronc_starts: "0"
+  light_A_leds_pot: "15"
+  light_A_leds_pot_starts: "43"
+  light_B_led_number: "45"
+  light_B_leds_brac_adalt: "15"
+  light_B_leds_brac_adalt_starts: "0"
+  light_B_leds_brac_abaix: "30"
+  light_B_leds_brac_abaix_starts: "15"
+
+esphome:
+  name: cactushue
+  # Build propi: si compartis .esphome/build/cactushue amb cactushue.yaml, ESPHome ho netejaria tot a cada canvi de fitxer.
+  build_path: .esphome/build/cactus_ambilight
+  friendly_name: Cactus Hue
+  comment: "Variant per Philips Hue Bridge (component huewejnorg fidel a wejn.org). WS2812 57 LEDs tronc (GPIO19) + 45 LEDs brac (GPIO18)."
+  includes:
+    - coex_extern.h
+  on_boot:
+    # Coex WiFi/802.15.4 abans que WiFi arranqui l'scan.
+    - priority: 800
+      then:
+        - if:
+            condition:
+              lambda: "return id(sw_wifi_enabled).state == id(sw_zigbee_enabled).state;"
+            then:
+              - logger.log: "Mode combinat: finestra WiFi -> Zigbee"
+            else:
+              - if:
+                  condition:
+                    lambda: "return id(sw_wifi_enabled).state;"
+                  then:
+                    - logger.log: "Mode sols WiFi: Zigbee no s'arrancara"
+                  else:
+                    - logger.log: "Mode sols Zigbee: apagant WiFi i arrancant Zigbee"
+                    
+        - lambda: |-
+            int r = esp_coex_wifi_i154_enable();
+            ESP_LOGI("coex_early", "esp_coex_wifi_i154_enable() -> %d", r);
+    - priority: -100
+      then:
+        # cactus_loop executa cactus_create 2 vegades (create -> create),
+        # sense disappears. Duracio aprox: 2 * (52 * step_ms + 200) ms.
+        # apply_connectivity corre en paral.lel pero nomes gestiona WiFi/Zigbee
+        # (no toca LEDs), aixi no interfereix amb el loop.
+        - script.execute: cactus_loop
+        - script.execute: apply_connectivity
+
+esp32:
+  board: esp32-c6-devkitc-1
+  variant: esp32c6
+  flash_size: 4MB
+  partitions: partitions_zb.csv
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESPTOOLPY_FLASHSIZE_4MB: y
+      CONFIG_ESP_TASK_WDT_TIMEOUT_S: "25"
+      CONFIG_LOG_DYNAMIC_LEVEL_CONTROL: y
+      CONFIG_VFS_SUPPORT_SELECT: y
+      CONFIG_RMT_TX_ISR_CACHE_SAFE: y
+
+logger:
+  baud_rate: 115200
+  level: INFO
+  logs:
+    zigbee: INFO
+    esp-zboss: INFO
+    esp-zigbee: INFO
+    component: WARN
+    sensor: WARN
+    light: WARN
+    wifi: INFO
+    api: WARN
+    esp-idf: WARN
+    esp32_rmt_led_strip: WARN
+    button: WARN
+    partition: WARN
+    Zigbee_main: INFO
+
+api:
+  reboot_timeout: 0s
+  encryption:
+    key: !secret api_key_cactushue
+  actions:
+    - action: run_cactus_create
+      then:
+        - script.execute: cactus_loop
+    - action: run_cactus_foc_pot
+      then:
+        - script.execute: cactus_foc_pot_run
+    - action: run_cactus_glacial
+      then:
+        - script.execute: cactus_glacial_run
+    - action: run_cactus_ronvv
+      then:
+        - script.execute: cactus_ronvv_run
+    - action: run_switch_to_wifi
+      then:
+        - script.execute: switch_to_wifi
+
+ota:
+  - platform: esphome
+    on_begin:
+      then:
+        - lambda: id(ota_active) = true;
+        - logger.log: "OTA iniciado: ventana WiFi extendida"
+    on_error:
+      then:
+        - lambda: id(ota_active) = false;
+        - logger.log: "OTA fallido: cerrando WiFi y pasando a Zigbee"
+        - script.execute: switch_to_zigbee
+
+i2c:
+  - scan: False
+
+wifi:
+  min_auth_mode: WPA2
+  networks:
+    # - ssid: !secret wifi_ssid_b
+    #   password: !secret wifi_password
+    #   priority: 1
+    - ssid: !secret wifi_ssid
+      password: !secret wifi_password
+      priority: 1
+    # - ssid: !secret mobile_ssid
+    #   password: !secret mobile_password
+    #   priority: 1
+  power_save_mode: NONE
+  reboot_timeout: 0s
+  output_power: 20dB
+  on_connect:
+    - lambda: id(wifi_up) = true;
+  on_disconnect:
+    - lambda: id(wifi_up) = false;
+
+external_components:
+  # huewejnorg: fork del huezigbee que aplica els 4 fixos de wejn.org per
+  # emparellar-se amb un Philips Hue Bridge real:
+  #   1. TC key DISTRIBUIDA (esp_zb_secur_TC_standard_distributed_key_set +
+  #      esp_zb_enable_joining_to_distributed), join_mode: distributed.
+  #   2. app_device_version = 1 (era 0).
+  #   3. Atributs ON_TIME (0x4001) i GLOBAL_SCENE_CONTROL (0x4000) del cluster
+  #      ON_OFF — configurats al YAML sota cada endpoint color.
+  #   4. LEAVE-with-reset handler sense reboot (nvram_erase_at_start + steering).
+  - source:
+      type: local
+      path: components
+    components: [huewejnorg]
+
+globals:
+  # (col_r/g/b eliminats: codi mort, cap efecte actual els llegeix.)
+  - id: wifi_up
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: ota_active
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: conn_cfg_version
+    type: int
+    restore_value: yes
+    initial_value: '0'
+  - id: zb_mode
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  # Estat de la "bombeta" Hue (endpoint 11). hue_mode: 0 = HS, 1 = XY (CIE 1931), 2 = CT (mireds).
+  - id: hue_on
+    type: bool
+    restore_value: no
+    initial_value: "true"
+  - id: hue_level
+    type: float
+    restore_value: no
+    initial_value: "1.0"
+  - id: hue_mode
+    type: int
+    restore_value: no
+    initial_value: "2"
+  - id: hue_x
+    type: float
+    restore_value: no
+    initial_value: "0.3127"
+  - id: hue_y
+    type: float
+    restore_value: no
+    initial_value: "0.3290"
+  - id: hue_ct
+    type: float
+    restore_value: no
+    initial_value: "366"
+  # Mode Hue: true mentre el cos del cactus (tronc + bracos) el pinta l'estat Hue. S'activa amb la primera ordre Hue
+  # (hue_render) i el desactiva qualsevol efecte (cactus_create, foc pot...) que torni a fer servir planta/strips.
+  - id: hue_body_mode
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  # Ambilight: amb_active = el cos el pinta el stream; amb_blocked = un efecte de HA l'ha tallat fins a fi de sessio.
+  - id: amb_active
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: amb_blocked
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: amb_r
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: amb_g
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: amb_b
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: amb_bri
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: hue_h
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: hue_s
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: cactus_start_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  # Nivell d'intensitat (1..3) compartit per tots els efectes creatius:
+  # Lightning Rain, Rain Drops, Breathing Aurora, Sparkle Twinkle, Fire Rise.
+  - id: lr_level
+    type: uint8_t
+    restore_value: no
+    initial_value: "1"
+  - id: lr_direction # 0 = up (baix->dalt), 1 = down (nomes Lightning Rain / Rain Drops)
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+  # Color del pot (LEDs 42..56 de strip_tronc). Els efectes el pinten
+  # a cada frame. Actualitzat per on_state de "Planta" (pendent).
+  - id: pot_r
+    type: uint8_t
+    restore_value: no
+    initial_value: "255"
+  - id: pot_g
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+  - id: pot_b
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+
+light:
+  # ================================================================
+  # Tires RAW (internes). C6: 2 canals RMT TX x 48 simbols.
+  # ================================================================
+
+  # ---- TRONC (57 LEDs total, GPIO19) ----
+  # 42 LEDs tronc (indexs 0..41) + 15 LEDs pot (42..56).
+  # index 0 = a dalt del tronc, index 56 = fons del pot.
+  # NOTA: els 2 LEDs afegits al tip (indexs 0..1 nous) desplacen tota la
+  # numeracio +2 respecte al layout original. Les unions dels bracos, que
+  # abans eren tronc[14]/[24], ara son tronc[16]/[26].
+  - platform: esp32_rmt_led_strip
+    id: strip_tronc
+    internal: true
+    pin: GPIO19
+    rgb_order: GRB
+    num_leds: ${light_A_led_number}
+    chipset: ws2812
+    rmt_symbols: 48
+    # Sense transition (l'animacio pinta pixels directament).
+    default_transition_length: 0s
+    restore_mode: ALWAYS_OFF
+    effects:
+      # Cactus Create — creixement optimitzat (N=57):
+      #   t=0: pre-lit LEDs 52..56 vermell (5 LEDs, base del pot).
+      #   t=1..10: creixença vermella cap amunt (LED 51..42).
+      #   t=7: OPTICA — encenem tambe LED 41 (ultim del tronc, adjacent al
+      #        pot) amb el seu degradat, per anticipar l'arribada del tronc.
+      #   t=11..52: creixença verda cap amunt (LED 41..0).
+      # Degradat del tronc: 100% al LED 0 (dalt) -> 70% al LED 41 (baix,
+      # adjacent al pot). Lineal, incremental.
+      # Cada step = ${step_ms}ms -> animacio total = 52 * step_ms.
+      - addressable_lambda:
+          name: "Cactus Create"
+          update_interval: ${step_ms}ms
+          lambda: |-
+            const int N = ${light_A_led_number};
+            uint32_t start = id(cactus_start_ms);
+            uint32_t el_ms = start ? (millis() - start) : 0;
+            int t = (int)(el_ms / ${step_ms});
+            if (t > 52) t = 52;
+            for (int i = 0; i < N; i++) {
+              if (i >= 52) {
+                // Pot base (5 LEDs) pre-lit amb color de pot.
+                it[i] = Color(id(pot_r), id(pot_g), id(pot_b));
+              } else if (i >= ${light_A_leds_pot_starts}) {
+                // Pot top (10 LEDs): LED i s'encen a t = 52 - i.
+                if (t >= (52 - i)) it[i] = Color(id(pot_r), id(pot_g), id(pot_b));
+                else               it[i] = Color(0, 0, 0);
+              } else {
+                // Tronc (42 LEDs): normal a t = 52 - i (LED 41 a t=11,
+                // LED 0 a t=52). Optica: LED 41 tambe a t=7.
+                bool normal_lit = (t >= 52 - i);
+                bool early_lit  = (i == 41 && t >= 7);
+                if (normal_lit || early_lit) {
+                  // Degradat: 100% (i=0) -> 70% (i=41). Lineal.
+                  float bright = 1.0f - (float)i / 41.0f * 0.3f;
+                  uint8_t g = (uint8_t)(255.0f * bright);
+                  it[i] = Color(0, g, 0);
+                } else {
+                  it[i] = Color(0, 0, 0);
+                }
+              }
+            }
+
+      # Lightning Rain — llamp meteorologic realista.
+      # Model per-LED: cada LED te una envolvent temporal (pujada rapida ->
+      # pic -> decay exponencial). El "front" d'ona propaga per la tira amb
+      # velocitat no-lineal + jitter deterministic (efecte "stepped leader").
+      # Restrikes: L2/L3 disparen mes de un stroke amb atenuacio progressiva.
+      # Colors blanc-blavosos (llamp real, no verds); a mes potents com mes
+      # a prop, perque la lampara blanca atenua molt.
+      # Direccio 0 = puja (origen LED 41), 1 = baixa (origen LED 0).
+      # Pot (42..56) sempre vermell.
+      - addressable_lambda:
+          name: "Lightning Rain"
+          update_interval: 15ms
+          lambda: |-
+            const int N = ${light_A_led_number};
+            const int TN = ${light_A_leds_tronc};   // LEDs de tronc (0..41)
+            uint32_t start = id(cactus_start_ms);
+            uint32_t el_ms = start ? (millis() - start) : 0;
+            float t_ms = (float)el_ms;
+            uint8_t level = id(lr_level);
+            uint8_t direction = id(lr_direction);
+
+            // ---- Parametres per nivell ----
+            uint32_t prop_ms;         // temps del front per creuar la tira
+            uint32_t rise_ms;         // rampa d'encesa per-LED
+            float    decay_tau;       // constant de decay exponencial
+            uint8_t  num_strikes;
+            uint32_t restrike_gap;    // ms entre inici de strokes
+            float    restrike_atten;  // factor d'atenuacio per stroke
+            uint8_t  peak_r, peak_g, peak_b;
+            float    peak_amp;
+            float    jitter_scale;    // magnitud del jitter per-LED (ms)
+
+            if (level <= 1) {
+              // Llamp llunya: propagacio lenta, blau-blanc suau, 1 stroke.
+              prop_ms = 220; rise_ms = 30; decay_tau = 240.0f;
+              num_strikes = 1; restrike_gap = 0; restrike_atten = 1.0f;
+              peak_r = 170; peak_g = 190; peak_b = 230; peak_amp = 0.72f;
+              jitter_scale = 4.0f;
+            } else if (level == 2) {
+              // Llamp mitja distancia: mes rapid, casi blanc, 2 strokes.
+              prop_ms = 100; rise_ms = 12; decay_tau = 160.0f;
+              num_strikes = 2; restrike_gap = 220; restrike_atten = 0.70f;
+              peak_r = 230; peak_g = 240; peak_b = 255; peak_amp = 0.92f;
+              jitter_scale = 6.0f;
+            } else {
+              // Llamp proper: front rapidissim, blanc pur, 4 strokes ("staccato").
+              prop_ms = 45; rise_ms = 4; decay_tau = 90.0f;
+              num_strikes = 4; restrike_gap = 75; restrike_atten = 0.75f;
+              peak_r = 255; peak_g = 255; peak_b = 255; peak_amp = 1.00f;
+              jitter_scale = 8.0f;
+            }
+
+            for (int i = 0; i < N; i++) {
+              if (i >= ${light_A_leds_pot_starts}) {
+                it[i] = Color(id(pot_r), id(pot_g), id(pot_b));
+                continue;
+              }
+              // Posicio 0 a l'origen del front, 1 a l'extrem final.
+              int pos = (direction == 0) ? (TN - 1 - i) : i;
+              float u = (float)pos / (float)(TN - 1);
+              // Velocitat variable: accelera lleugerament (u^0.85).
+              float base_delay = powf(u, 0.85f) * (float)prop_ms;
+              // Jitter deterministic per-LED (hash MurmurMix).
+              uint32_t h = ((uint32_t)i + 1u) * 2654435761u;
+              h ^= h >> 16;
+              h *= 0x85ebca6bu;
+              float jit = ((float)(h & 0xffff) / 65535.0f - 0.5f) * 2.0f * jitter_scale;
+              float prop_delay = base_delay + jit;
+              if (prop_delay < 0.0f) prop_delay = 0.0f;
+
+              // Sobre-suma d'envolvents (max entre strokes -> visible re-flash).
+              float amp = 0.0f;
+              float atten = 1.0f;
+              for (uint8_t s = 0; s < num_strikes; s++) {
+                float t_arr = (float)s * (float)restrike_gap + prop_delay;
+                float local_t = t_ms - t_arr;
+                if (local_t >= 0.0f) {
+                  float s_amp;
+                  if (local_t < (float)rise_ms) {
+                    s_amp = local_t / (float)rise_ms;
+                  } else {
+                    s_amp = expf(-(local_t - (float)rise_ms) / decay_tau);
+                  }
+                  s_amp *= atten;
+                  if (s_amp > amp) amp = s_amp;
+                }
+                atten *= restrike_atten;
+              }
+              amp *= peak_amp;
+
+              float r = (float)peak_r * amp;
+              float g = (float)peak_g * amp;
+              float b = (float)peak_b * amp;
+              if (r > 255.0f) r = 255.0f;
+              if (g > 255.0f) g = 255.0f;
+              if (b > 255.0f) b = 255.0f;
+              it[i] = Color((uint8_t)r, (uint8_t)g, (uint8_t)b);
+            }
+
+      # ====================================================
+      # Efectes creatius (nomes tronc 0..41; pot llegeix pot_r/g/b).
+      # Els braços queden dark durant aquests efectes (strip_brac off).
+      # Els 3 nivells (lr_level 1..3) donen densitat/velocitat/color creixent.
+      # ====================================================
+
+      # -------- Rain Drops --------
+      # Gotes que cauen (o pugen amb direction=1) pel tronc en "carrils"
+      # paral.lels desfasats. Cada gota te un cap brillant i una cua que
+      # decau exponencialment darrere seu. Direccio 0 = dalt->baix (natural).
+      - addressable_lambda:
+          name: "Rain Drops"
+          update_interval: 20ms
+          lambda: |-
+            const int N = ${light_A_led_number};
+            const int TN = ${light_A_leds_tronc};
+            uint32_t start = id(cactus_start_ms);
+            uint32_t el_ms = start ? (millis() - start) : 0;
+            float t_ms = (float)el_ms;
+            uint8_t level = id(lr_level);
+            uint8_t direction = id(lr_direction);
+
+            uint8_t n_drops;
+            float   period_ms;   // temps que triga una gota en creuar la tira
+            float   tail_len;    // longitud de la cua (en LEDs)
+            uint8_t base_r, base_g, base_b;
+            if (level <= 1) {
+              n_drops = 3;  period_ms = 3000.0f; tail_len = 3.5f;
+              base_r = 0; base_g = 200; base_b = 100;
+            } else if (level == 2) {
+              n_drops = 5;  period_ms = 1800.0f; tail_len = 4.0f;
+              base_r = 0; base_g = 220; base_b = 180;
+            } else {
+              n_drops = 8;  period_ms = 1200.0f; tail_len = 4.5f;
+              base_r = 0; base_g = 255; base_b = 220;
+            }
+
+            float acc[${light_A_leds_tronc}];   // TN posicions (abans 42 fix: desbordava amb TN = 43)
+            for (int i = 0; i < TN; i++) acc[i] = 0.0f;
+
+            for (uint8_t d = 0; d < n_drops; d++) {
+              // Desfasament de fase entre gotes + jitter deterministic
+              // per no-uniformitat.
+              uint32_t h = ((uint32_t)d + 1u) * 2654435761u;
+              h ^= h >> 16;
+              h *= 0x85ebca6bu;
+              float jit = ((float)(h & 0xffff) / 65535.0f - 0.5f) * (period_ms * 0.3f);
+              float phase = period_ms * (float)d / (float)n_drops;
+              float drop_t = fmodf(t_ms + phase + jit + period_ms, period_ms);
+              // Posicio del cap 0..TN-1
+              float head = drop_t / period_ms * (float)(TN - 1);
+              for (int i = 0; i < TN; i++) {
+                // Distancia LED->cap en unitats de LED, tenint en compte direccio.
+                float dist = (direction == 0) ? ((float)i - head) : (head - (float)i);
+                // dist > 0.5 vol dir "davant" del cap (encara no illuminat).
+                if (dist > 0.5f) continue;
+                float behind = -dist;   // >= 0 quan el cap ja hi ha passat
+                float amp = expf(-behind / tail_len);
+                if (amp > acc[i]) acc[i] = amp;
+              }
+            }
+
+            for (int i = 0; i < N; i++) {
+              if (i >= ${light_A_leds_pot_starts}) {
+                it[i] = Color(id(pot_r), id(pot_g), id(pot_b));
+                continue;
+              }
+              float a = (i < TN) ? acc[i] : 0.0f;
+              uint8_t r = (uint8_t)((float)base_r * a);
+              uint8_t g = (uint8_t)((float)base_g * a);
+              uint8_t b = (uint8_t)((float)base_b * a);
+              it[i] = Color(r, g, b);
+            }
+
+      # -------- Breathing Aurora --------
+      # Ona sinusoidal de brillantor que puja-baixa lentament pel tronc,
+      # amb el hue derivant a l'entorn del verd (verd -> cian -> verd).
+      # Suau, meditativa. Sense direccio (l'ona va d'anada i tornada).
+      - addressable_lambda:
+          name: "Breathing Aurora"
+          update_interval: 33ms
+          lambda: |-
+            const int N = ${light_A_led_number};
+            const int TN = ${light_A_leds_tronc};
+            uint32_t start = id(cactus_start_ms);
+            uint32_t el_ms = start ? (millis() - start) : 0;
+            float t_s = (float)el_ms / 1000.0f;
+            uint8_t level = id(lr_level);
+
+            float breath_hz;   // freq de la respiracio
+            float hue_hz;      // freq del hue-shift
+            float hue_range;   // amplitud del hue-shift (unitats hue 0..1)
+            float wavelength;  // longitud d'ona espacial (cicles per tronc)
+            float min_amp;     // pis de brillantor (evita apagat total)
+            if (level <= 1) {
+              breath_hz = 0.15f; hue_hz = 0.05f; hue_range = 0.05f;
+              wavelength = 0.6f; min_amp = 0.15f;
+            } else if (level == 2) {
+              breath_hz = 0.30f; hue_hz = 0.10f; hue_range = 0.10f;
+              wavelength = 1.0f; min_amp = 0.25f;
+            } else {
+              breath_hz = 0.55f; hue_hz = 0.18f; hue_range = 0.18f;
+              wavelength = 1.6f; min_amp = 0.35f;
+            }
+
+            // Hue base 0.35 = verd; oscila cap a 0.45 (cian).
+            float hue = 0.35f + hue_range * sinf(2.0f * (float)M_PI * hue_hz * t_s);
+            float breath_phase = 2.0f * (float)M_PI * breath_hz * t_s;
+
+            for (int i = 0; i < N; i++) {
+              if (i >= ${light_A_leds_pot_starts}) {
+                it[i] = Color(id(pot_r), id(pot_g), id(pot_b));
+                continue;
+              }
+              float pos_norm = (float)i / (float)(TN - 1);   // 0..1
+              float pw = sinf(2.0f * (float)M_PI * wavelength * pos_norm - breath_phase);
+              float amp = min_amp + (1.0f - min_amp) * (0.5f + 0.5f * pw);
+              // HSV -> RGB (saturacio 1.0). Formulacio compacta.
+              float h6 = hue * 6.0f;
+              int hi = (int)h6 % 6; if (hi < 0) hi += 6;
+              float f = h6 - floorf(h6);
+              float q = 1.0f - f;
+              float r_f, g_f, b_f;
+              switch (hi) {
+                case 0: r_f = 1;   g_f = f;   b_f = 0;   break;
+                case 1: r_f = q;   g_f = 1;   b_f = 0;   break;
+                case 2: r_f = 0;   g_f = 1;   b_f = f;   break;
+                case 3: r_f = 0;   g_f = q;   b_f = 1;   break;
+                case 4: r_f = f;   g_f = 0;   b_f = 1;   break;
+                default: r_f = 1;  g_f = 0;   b_f = q;   break;
+              }
+              uint8_t r = (uint8_t)(255.0f * r_f * amp);
+              uint8_t g = (uint8_t)(255.0f * g_f * amp);
+              uint8_t b = (uint8_t)(255.0f * b_f * amp);
+              it[i] = Color(r, g, b);
+            }
+
+      # -------- Sparkle Twinkle --------
+      # LEDs individuals fan un flash breu (guspira) sobre un fons verd
+      # tenue. Cada LED te la seva "finestra" periodica desfasada per
+      # hash deterministic (aparença aleatoria pero reproduible).
+      - addressable_lambda:
+          name: "Sparkle Twinkle"
+          update_interval: 20ms
+          lambda: |-
+            const int N = ${light_A_led_number};
+            const int TN = ${light_A_leds_tronc};
+            uint32_t start = id(cactus_start_ms);
+            uint32_t el_ms = start ? (millis() - start) : 0;
+            float t_ms = (float)el_ms;
+            uint8_t level = id(lr_level);
+
+            float   window_ms;    // periode entre guspires per LED
+            float   sparkle_dur;  // duracio de cada guspira
+            uint8_t sp_r, sp_g, sp_b;
+            uint8_t bg_r, bg_g, bg_b;
+            if (level <= 1) {
+              window_ms = 6000.0f; sparkle_dur = 350.0f;
+              sp_r = 255; sp_g = 220; sp_b = 140;    // ambar calid
+              bg_r = 0;   bg_g = 15;  bg_b = 5;
+            } else if (level == 2) {
+              window_ms = 3000.0f; sparkle_dur = 250.0f;
+              sp_r = 255; sp_g = 235; sp_b = 180;    // daurat
+              bg_r = 0;   bg_g = 25;  bg_b = 12;
+            } else {
+              window_ms = 1500.0f; sparkle_dur = 180.0f;
+              sp_r = 255; sp_g = 255; sp_b = 240;    // blanc pur
+              bg_r = 0;   bg_g = 40;  bg_b = 20;
+            }
+
+            for (int i = 0; i < N; i++) {
+              if (i >= ${light_A_leds_pot_starts}) {
+                it[i] = Color(id(pot_r), id(pot_g), id(pot_b));
+                continue;
+              }
+              // Offset per-LED deterministic (0..window_ms).
+              uint32_t h = ((uint32_t)i + 7u) * 0x9E3779B1u;
+              h ^= h >> 13;
+              h *= 0xC2B2AE35u;
+              float offset = ((float)(h & 0xffff) / 65535.0f) * window_ms;
+              float local_t = fmodf(t_ms + offset, window_ms);
+              float amp = 0.0f;
+              if (local_t < sparkle_dur) {
+                float phase = local_t / sparkle_dur;
+                amp = sinf((float)M_PI * phase);   // 0..1..0
+              }
+              // Mix: fons + guspira additiu (satura a 255).
+              float r_f = (float)bg_r + (float)sp_r * amp;
+              float g_f = (float)bg_g + (float)sp_g * amp;
+              float b_f = (float)bg_b + (float)sp_b * amp;
+              if (r_f > 255.0f) r_f = 255.0f;
+              if (g_f > 255.0f) g_f = 255.0f;
+              if (b_f > 255.0f) b_f = 255.0f;
+              it[i] = Color((uint8_t)r_f, (uint8_t)g_f, (uint8_t)b_f);
+            }
+
+      # -------- Fire Rise --------
+      # Simulacio de flama: base calenta (vermell/taronja), puntes fredes.
+      # Parpelleig turbulent per superposicio de sinusoides a diferents
+      # frequencies + jitter per-LED. Mapeig heat -> color tipus foc.
+      - addressable_lambda:
+          name: "Fire Rise"
+          update_interval: 25ms
+          lambda: |-
+            const int N = ${light_A_led_number};
+            const int TN = ${light_A_leds_tronc};
+            uint32_t start = id(cactus_start_ms);
+            uint32_t el_ms = start ? (millis() - start) : 0;
+            float t_s = (float)el_ms / 1000.0f;
+            uint8_t level = id(lr_level);
+
+            float height_boost;  // altura efectiva de la flama
+            float turb;          // magnitud del parpelleig
+            float freq_scale;    // rapidesa del parpelleig
+            if (level <= 1) {
+              height_boost = 0.60f; turb = 0.25f; freq_scale = 1.0f;
+            } else if (level == 2) {
+              height_boost = 1.00f; turb = 0.35f; freq_scale = 1.6f;
+            } else {
+              height_boost = 1.50f; turb = 0.45f; freq_scale = 2.6f;
+            }
+
+            for (int i = 0; i < N; i++) {
+              if (i >= ${light_A_leds_pot_starts}) {
+                it[i] = Color(id(pot_r), id(pot_g), id(pot_b));
+                continue;
+              }
+              // i=0 dalt (fred), i=41 baix (calent).
+              float height = (float)i / (float)(TN - 1);
+              // Fase per-LED (evita mateixa flama a tots els LEDs).
+              float ph = (float)i * 0.37f;
+              float noise =
+                  0.50f * sinf(2.0f * (float)M_PI * (t_s * 3.0f * freq_scale + ph)) +
+                  0.30f * sinf(2.0f * (float)M_PI * (t_s * 7.1f * freq_scale + ph * 1.7f)) +
+                  0.20f * sinf(2.0f * (float)M_PI * (t_s * 11.3f * freq_scale + ph * 2.3f));
+              float heat = height * height_boost * (1.0f + turb * noise);
+              if (heat < 0.0f) heat = 0.0f;
+              if (heat > 1.0f) heat = 1.0f;
+              // Mapeig heat -> foc:
+              //   0.0-0.5: negre -> vermell pur.
+              //   0.5-0.85: vermell -> taronja (afegeix verd).
+              //   0.85-1.0: taronja -> groc/blanc (afegeix blau).
+              float r_f = (heat < 0.5f) ? (heat * 2.0f) : 1.0f;
+              float g_f = (heat < 0.5f) ? 0.0f
+                        : (heat < 0.85f ? (heat - 0.5f) / 0.35f : 1.0f);
+              float b_f = (heat < 0.85f) ? 0.0f : ((heat - 0.85f) / 0.15f);
+              uint8_t r = (uint8_t)(255.0f * r_f);
+              uint8_t g = (uint8_t)(255.0f * g_f);
+              uint8_t b = (uint8_t)(255.0f * b_f);
+              it[i] = Color(r, g, b);
+            }
+
+      # -------- Foc Pot --------
+      # Foc que neix al pot i puja pel tronc. A diferencia de "Fire Rise",
+      # aqui el pot NO usa pot_r/g/b: forma part del foc (base incandescent
+      # amb parpelleig). El tronc te heat que decau amb l'alcada (i=0 dalt =
+      # mes fred). Nivell escala altura de la flama i turbulencia.
+      - addressable_lambda:
+          name: "Foc Pot"
+          update_interval: 30ms
+          lambda: |-
+            const int N = ${light_A_led_number};
+            const int TN = ${light_A_leds_tronc};
+            const int POT_START = ${light_A_leds_pot_starts};
+            uint32_t start = id(cactus_start_ms);
+            uint32_t el_ms = start ? (millis() - start) : 0;
+            float t_s = (float)el_ms / 1000.0f;
+            uint8_t level = id(lr_level);
+
+            float flame_height;   // fraccio del tronc que arriba a cremar
+            float turb;
+            float freq_scale;
+            if (level <= 1) {
+              flame_height = 0.45f; turb = 0.30f; freq_scale = 1.0f;
+            } else if (level == 2) {
+              flame_height = 0.75f; turb = 0.40f; freq_scale = 1.6f;
+            } else {
+              flame_height = 1.10f; turb = 0.50f; freq_scale = 2.6f;
+            }
+
+            // ---- POT: base incandescent amb parpelleig taronja-blanc ----
+            for (int i = POT_START; i < N; i++) {
+              float ph = (float)i * 0.53f;
+              float noise =
+                  0.60f * sinf(2.0f * (float)M_PI * (t_s * 4.0f * freq_scale + ph)) +
+                  0.40f * sinf(2.0f * (float)M_PI * (t_s * 9.3f * freq_scale + ph * 1.7f));
+              float heat = 0.90f + 0.10f * noise;
+              if (heat < 0.60f) heat = 0.60f;
+              if (heat > 1.00f) heat = 1.00f;
+              float r_f = 1.0f;
+              float g_f = (heat < 0.85f) ? (heat - 0.5f) / 0.35f : 1.0f;
+              float b_f = (heat < 0.85f) ? 0.0f : ((heat - 0.85f) / 0.15f);
+              uint8_t r = (uint8_t)(255.0f * r_f);
+              uint8_t g = (uint8_t)(255.0f * g_f);
+              uint8_t b = (uint8_t)(255.0f * b_f);
+              it[i] = Color(r, g, b);
+            }
+
+            // ---- TRONC: flames pujant. i=TN-1 (base, junt al pot) mes ----
+            // calent, i=0 (dalt) fred. Mateix mapeig heat->color que Fire Rise.
+            for (int i = 0; i < TN; i++) {
+              float pos_up = (float)(TN - 1 - i) / (float)(TN - 1);
+              float ph = (float)i * 0.37f;
+              float noise =
+                  0.50f * sinf(2.0f * (float)M_PI * (t_s * 3.0f * freq_scale + ph)) +
+                  0.30f * sinf(2.0f * (float)M_PI * (t_s * 7.1f * freq_scale + ph * 1.7f)) +
+                  0.20f * sinf(2.0f * (float)M_PI * (t_s * 11.3f * freq_scale + ph * 2.3f));
+              float heat = pos_up * flame_height * (1.0f + turb * noise);
+              if (heat < 0.0f) heat = 0.0f;
+              if (heat > 1.0f) heat = 1.0f;
+              float r_f = (heat < 0.5f) ? (heat * 2.0f) : 1.0f;
+              float g_f = (heat < 0.5f) ? 0.0f
+                        : (heat < 0.85f ? (heat - 0.5f) / 0.35f : 1.0f);
+              float b_f = (heat < 0.85f) ? 0.0f : ((heat - 0.85f) / 0.15f);
+              uint8_t r = (uint8_t)(255.0f * r_f);
+              uint8_t g = (uint8_t)(255.0f * g_f);
+              uint8_t b = (uint8_t)(255.0f * b_f);
+              it[i] = Color(r, g, b);
+            }
+
+      # -------- Glacial --------
+      # Base cyan-blau amb shimmer sinusoidal + guspires blanques ocasionals
+      # per-LED (fase deterministica). Sensacio freda i cristal.lina.
+      # Pot inclos al mateix efecte (blau gel).
+      - addressable_lambda:
+          name: "Glacial"
+          update_interval: 40ms
+          lambda: |-
+            const int N = ${light_A_led_number};
+            uint32_t start = id(cactus_start_ms);
+            uint32_t el_ms = start ? (millis() - start) : 0;
+            float t_s = (float)el_ms / 1000.0f;
+            float t_ms = (float)el_ms;
+            uint8_t level = id(lr_level);
+
+            float shimmer_hz;
+            float window_ms;    // periode entre guspires per LED
+            float sparkle_dur;
+            uint8_t base_r, base_g, base_b;
+            if (level <= 1) {
+              shimmer_hz = 0.20f; window_ms = 4500.0f; sparkle_dur = 250.0f;
+              base_r = 10; base_g = 60;  base_b = 140;  // blau fred
+            } else if (level == 2) {
+              shimmer_hz = 0.40f; window_ms = 2500.0f; sparkle_dur = 200.0f;
+              base_r = 30; base_g = 110; base_b = 190;  // cyan gel
+            } else {
+              shimmer_hz = 0.80f; window_ms = 1200.0f; sparkle_dur = 150.0f;
+              base_r = 80; base_g = 180; base_b = 230;  // cyan brillant
+            }
+
+            for (int i = 0; i < N; i++) {
+              float ph = (float)i * 0.29f;
+              float shimmer = 0.5f + 0.5f * sinf(2.0f * (float)M_PI * shimmer_hz * t_s + ph);
+              float base_amp = 0.60f + 0.40f * shimmer;
+
+              // Guspira blanca per-LED (deterministica).
+              uint32_t h = ((uint32_t)i + 11u) * 0x9E3779B1u;
+              h ^= h >> 13;
+              h *= 0xC2B2AE35u;
+              float offset = ((float)(h & 0xffff) / 65535.0f) * window_ms;
+              float local_t = fmodf(t_ms + offset, window_ms);
+              float sparkle = 0.0f;
+              if (local_t < sparkle_dur) {
+                float phase = local_t / sparkle_dur;
+                sparkle = sinf((float)M_PI * phase);   // 0..1..0
+              }
+
+              float r_f = (float)base_r * base_amp + 255.0f * sparkle;
+              float g_f = (float)base_g * base_amp + 255.0f * sparkle;
+              float b_f = (float)base_b * base_amp + 255.0f * sparkle;
+              if (r_f > 255.0f) r_f = 255.0f;
+              if (g_f > 255.0f) g_f = 255.0f;
+              if (b_f > 255.0f) b_f = 255.0f;
+              it[i] = Color((uint8_t)r_f, (uint8_t)g_f, (uint8_t)b_f);
+            }
+
+      # -------- RONVV (Roig-Taronja-Violeta) --------
+      # Ona de color que viatja cicant taronja -> vermell -> violeta ->
+      # taronja. Cada LED es un punt de fase diferent al cicle
+      # (interpolacio lineal entre 3 punts de la paleta).
+      - addressable_lambda:
+          name: "RONVV"
+          update_interval: 33ms
+          lambda: |-
+            const int N = ${light_A_led_number};
+            uint32_t start = id(cactus_start_ms);
+            uint32_t el_ms = start ? (millis() - start) : 0;
+            float t_s = (float)el_ms / 1000.0f;
+            uint8_t level = id(lr_level);
+
+            float cycle_hz;      // freq del cicle temporal
+            float wavelength;    // cicles per tira (mes = mes bandes)
+            if (level <= 1) {
+              cycle_hz = 0.15f; wavelength = 0.5f;
+            } else if (level == 2) {
+              cycle_hz = 0.30f; wavelength = 1.0f;
+            } else {
+              cycle_hz = 0.60f; wavelength = 1.8f;
+            }
+
+            // Paleta 3 punts: taronja (255,110,0) -> vermell (220,0,20) ->
+            // violeta (150,0,200) -> torna a taronja.
+            for (int i = 0; i < N; i++) {
+              float pos_norm = (float)i / (float)(N - 1);
+              float phase = fmodf(cycle_hz * t_s + wavelength * pos_norm, 1.0f);
+              if (phase < 0.0f) phase += 1.0f;
+              float p3 = phase * 3.0f;
+              int seg = (int)p3; float f = p3 - (float)seg;
+              float r1, g1, b1, r2, g2, b2;
+              if (seg == 0) {
+                r1 = 255; g1 = 110; b1 =   0;
+                r2 = 220; g2 =   0; b2 =  20;
+              } else if (seg == 1) {
+                r1 = 220; g1 =   0; b1 =  20;
+                r2 = 150; g2 =   0; b2 = 200;
+              } else {
+                r1 = 150; g1 =   0; b1 = 200;
+                r2 = 255; g2 = 110; b2 =   0;
+              }
+              float r = r1 + (r2 - r1) * f;
+              float g = g1 + (g2 - g1) * f;
+              float b = b1 + (b2 - b1) * f;
+              it[i] = Color((uint8_t)r, (uint8_t)g, (uint8_t)b);
+            }
+
+  # ---- BRAC (45 LEDs, GPIO18) ----
+  # Fisicament 45 LEDs. Adalt fa servir 0..14 (15 LEDs), Abaix 15..29 (15 LEDs).
+  # Els 15 finals (30..44) queden fora de tota particio -> sempre off.
+  - platform: esp32_rmt_led_strip
+    id: strip_brac
+    internal: true
+    pin: GPIO18
+    rgb_order: GRB
+    num_leds: ${light_B_led_number}
+    chipset: ws2812
+    rmt_symbols: 48
+    # Sense transition (l'animacio pinta pixels directament).
+    default_transition_length: 0s
+    restore_mode: ALWAYS_OFF
+    effects:
+      # Sincronitzat amb el tronc (N=57, arriba a LED 41 a t=11, acaba a
+      # t=52). Els braços s'encenen quan el tronc normal arriba al seu
+      # LED d'unio:
+      #   brac Abaix uneix a tronc[26] -> normal_lit a t = 52-26 = 26
+      #   brac Adalt uneix a tronc[16] -> normal_lit a t = 52-16 = 36
+      # (No fan servir el "early ignition" del LED 41 del tronc.)
+      # Els indexs 30..44 SEMPRE off (cap llum).
+      - addressable_lambda:
+          name: "Cactus Create"
+          update_interval: ${step_ms}ms
+          lambda: |-
+            const int N = ${light_B_led_number};
+            uint32_t start = id(cactus_start_ms);
+            uint32_t el_ms = start ? (millis() - start) : 0;
+            int t = (int)(el_ms / ${step_ms});
+            if (t > 52) t = 52;
+            // Tot apagat.
+            for (int i = 0; i < N; i++) it[i] = Color(0, 0, 0);
+            // brac Abaix: indexs 15..29 (15 LEDs), comença a t=15
+            // (11 steps abans que el trigger normal del trunk[26] a t=26).
+            // S'encen primer l'ultim LED (index 29, l'extrem) i creix
+            // cap enrere fins a l'index 15 (arrel de la unio). Acaba a t=29.
+            if (t >= 15) {
+              int lit = t - 15;
+              if (lit > 14) lit = 14;
+              for (int i = 0; i <= lit; i++) {
+                it[29 - i] = Color(0, 255, 0);
+              }
+            }
+            // brac Adalt: indexs 0..14 (15 LEDs), comença a t=21
+            // (15 steps abans que el trigger normal del trunk[16] a t=36).
+            // S'encen primer l'ultim LED (index 14, l'extrem) i creix
+            // cap enrere fins a l'index 0 (arrel de la unio). Acaba a t=35.
+            if (t >= 21) {
+              int lit = t - 21;
+              if (lit > 14) lit = 14;
+              for (int i = 0; i <= lit; i++) {
+                it[14 - i] = Color(0, 255, 0);
+              }
+            }
+
+      # Lightning Rain (brac) — mateix model realista que el tronc.
+      # El front del tronc "salta" al brac quan arriba a la seva unio:
+      #   - brac Adalt: unio a tronc[16]
+      #   - brac Abaix: unio a tronc[26]
+      # Un cop dins del brac, propagacio amb la mateixa velocitat variable
+      # (escalada per longitud del brac vs tronc) i jitter propi.
+      # Els strokes i l'envolvent per-LED son identics al tronc.
+      # Indexs 30..44 sempre off.
+      - addressable_lambda:
+          name: "Lightning Rain"
+          update_interval: 15ms
+          lambda: |-
+            const int N = ${light_B_led_number};
+            const int TN = ${light_A_leds_tronc};   // LEDs de tronc (per calcular delays d'unio)
+            const int AN = ${light_B_leds_brac_adalt};   // LEDs per brac
+            uint32_t start = id(cactus_start_ms);
+            uint32_t el_ms = start ? (millis() - start) : 0;
+            float t_ms = (float)el_ms;
+            uint8_t level = id(lr_level);
+            uint8_t direction = id(lr_direction);
+
+            // ---- Parametres per nivell (identics al tronc) ----
+            uint32_t prop_ms, rise_ms, restrike_gap;
+            float    decay_tau, restrike_atten, peak_amp, jitter_scale;
+            uint8_t  num_strikes, peak_r, peak_g, peak_b;
+            if (level <= 1) {
+              prop_ms = 220; rise_ms = 30; decay_tau = 240.0f;
+              num_strikes = 1; restrike_gap = 0; restrike_atten = 1.0f;
+              peak_r = 170; peak_g = 190; peak_b = 230; peak_amp = 0.72f;
+              jitter_scale = 4.0f;
+            } else if (level == 2) {
+              prop_ms = 100; rise_ms = 12; decay_tau = 160.0f;
+              num_strikes = 2; restrike_gap = 220; restrike_atten = 0.70f;
+              peak_r = 230; peak_g = 240; peak_b = 255; peak_amp = 0.92f;
+              jitter_scale = 6.0f;
+            } else {
+              prop_ms = 45; rise_ms = 4; decay_tau = 90.0f;
+              num_strikes = 4; restrike_gap = 75; restrike_atten = 0.75f;
+              peak_r = 255; peak_g = 255; peak_b = 255; peak_amp = 1.00f;
+              jitter_scale = 8.0f;
+            }
+
+            // Delay del front del tronc a cada unio (mateix perfil u^0.85).
+            int junc_adalt_pos = (direction == 0) ? (TN - 1 - 16) : 16;
+            int junc_abaix_pos = (direction == 0) ? (TN - 1 - 26) : 26;
+            float u_adalt = (float)junc_adalt_pos / (float)(TN - 1);
+            float u_abaix = (float)junc_abaix_pos / (float)(TN - 1);
+            float delay_at_adalt = powf(u_adalt, 0.85f) * (float)prop_ms;
+            float delay_at_abaix = powf(u_abaix, 0.85f) * (float)prop_ms;
+            // Temps de propagacio dins del brac (mateixa velocitat mitjana).
+            float arm_prop_ms = (float)prop_ms * ((float)(AN - 1) / (float)(TN - 1));
+
+            for (int i = 0; i < N; i++) {
+              if (i >= 30) { it[i] = Color(0, 0, 0); continue; }
+              // arm_local: 0 = root (unio amb tronc), 14 = tip.
+              int arm_local = (i < 15) ? i : (i - 15);
+              float base_junc_delay = (i < 15) ? delay_at_adalt : delay_at_abaix;
+              float u_arm = (float)arm_local / (float)(AN - 1);
+              float arm_delay = powf(u_arm, 0.85f) * arm_prop_ms;
+              // Jitter propi per brac (seeds diferents -> no simetric).
+              uint32_t seed = (i < 15) ? 0x1111u : 0x2222u;
+              uint32_t h = ((uint32_t)arm_local + 1u) * 2654435761u + seed;
+              h ^= h >> 16;
+              h *= 0x85ebca6bu;
+              float jit = ((float)(h & 0xffff) / 65535.0f - 0.5f) * 2.0f * jitter_scale;
+              float prop_delay = base_junc_delay + arm_delay + jit;
+              if (prop_delay < 0.0f) prop_delay = 0.0f;
+
+              float amp = 0.0f;
+              float atten = 1.0f;
+              for (uint8_t s = 0; s < num_strikes; s++) {
+                float t_arr = (float)s * (float)restrike_gap + prop_delay;
+                float local_t = t_ms - t_arr;
+                if (local_t >= 0.0f) {
+                  float s_amp;
+                  if (local_t < (float)rise_ms) {
+                    s_amp = local_t / (float)rise_ms;
+                  } else {
+                    s_amp = expf(-(local_t - (float)rise_ms) / decay_tau);
+                  }
+                  s_amp *= atten;
+                  if (s_amp > amp) amp = s_amp;
+                }
+                atten *= restrike_atten;
+              }
+              amp *= peak_amp;
+
+              float r = (float)peak_r * amp;
+              float g = (float)peak_g * amp;
+              float b = (float)peak_b * amp;
+              if (r > 255.0f) r = 255.0f;
+              if (g > 255.0f) g = 255.0f;
+              if (b > 255.0f) b = 255.0f;
+              it[i] = Color((uint8_t)r, (uint8_t)g, (uint8_t)b);
+            }
+
+  # ================================================================
+  # 4 PARTICIONS logiques -> 4 llums Zigbee independents (control de
+  # color/brillantor individual). SENSE efectes: nomes color pla.
+  # ================================================================
+
+  - platform: partition
+    id: cactus_tronc
+    name: "Cactus tronc"
+    default_transition_length: 1s
+    restore_mode: ALWAYS_OFF
+    segments:
+      - id: strip_tronc
+        from: ${light_A_leds_tronc_starts}
+        to: 41
+    effects:
+      # Degradat estatic verd: 100% al LED 0 (dalt) -> 70% al LED 41 (baix).
+      # cactus_create l'aplica al final. Per canviar el color de la particio
+      # des de HA, seleccionar "None" com a efecte.
+      - addressable_lambda:
+          name: "Trunk Gradient"
+          update_interval: 33ms
+          lambda: |-
+            const int N = (int)it.size();
+            if (N < 2) return;
+            for (int i = 0; i < N; i++) {
+              float bright = 1.0f - (float)i / (float)(N - 1) * 0.3f;
+              uint8_t g = (uint8_t)(255.0f * bright);
+              it[i] = Color(0, g, 0);
+            }
+
+  - platform: partition
+    id: cactus_test
+    name: "Cactus Test"
+    default_transition_length: 1s
+    restore_mode: ALWAYS_OFF
+    segments:
+      - id: strip_tronc
+        from: ${light_A_leds_pot_starts}
+        to: 56
+    effects:
+      # Ambilight: color antagonic al dominant del cos (vermell -> blau, altrament vermell), amb la brillantor del stream.
+      - addressable_lambda:
+          name: "Ambilight Pot"
+          update_interval: 33ms
+          lambda: |-
+            const uint8_t v = (uint8_t) (id(amb_bri) * 255.0f);
+            const bool red_dom = id(amb_r) > id(amb_g) && id(amb_r) > id(amb_b);
+            it.all() = red_dom ? Color(0, 0, v) : Color(v, 0, 0);
+
+  - platform: partition
+    id: cactus_brac_adalt
+    name: "Cactus brac Adalt"
+    default_transition_length: 1s
+    restore_mode: ALWAYS_OFF
+    segments:
+      - id: strip_brac
+        from: ${light_B_leds_brac_adalt_starts}
+        to: 14
+
+  - platform: partition
+    id: cactus_brac_abaix
+    name: "Cactus brac Abaix"
+    default_transition_length: 1s
+    restore_mode: ALWAYS_OFF
+    segments:
+      - id: strip_brac
+        from: ${light_B_leds_brac_abaix_starts}
+        to: 29
+
+  # ---- Planta: agrupacio tronc + braços (72 LEDs) ----
+  # Els segments es concatenen: 0..41 tronc, 42..56 brac adalt, 57..71 brac abaix.
+  # Escriu sobre els mateixos LEDs que cactus_tronc/brac_adalt/brac_abaix,
+  # per tant NO enguegar-la alhora que les altres 3 particions (l'ultima
+  # ordre guanya).
+  - platform: partition
+    id: planta
+    name: "Planta"
+    # default 0s -> HA controla plenament la duracio de la transicio.
+    default_transition_length: 0s
+    restore_mode: ALWAYS_OFF
+    segments:
+      - id: strip_tronc
+        from: ${light_A_leds_tronc_starts}
+        to: 41
+      - id: strip_brac
+        from: ${light_B_leds_brac_adalt_starts}
+        to: 14
+      - id: strip_brac
+        from: ${light_B_leds_brac_abaix_starts}
+        to: 29
+    # Regla del pot: color antagonic al component dominant de Planta.
+    #   Vermell dominant  -> pot BLAU
+    #   Verd dominant     -> pot VERMELL
+    #   Blau dominant     -> pot VERMELL
+    #   Empat / neutre    -> pot VERMELL (fallback)
+    # Quan Planta esta apagada, no s'actualitza res.
+    on_state:
+      - lambda: |-
+          if (id(amb_active)) return;  // el pot el pinta l'efecte Ambilight Pot
+          auto v = id(planta).current_values;
+          if (v.get_state() < 0.5f) return;
+          float r = v.get_red();
+          float g = v.get_green();
+          float b = v.get_blue();
+          uint8_t nr, ng, nb;
+          if (r > g && r > b) {
+            // Vermell dominant -> pot blau.
+            nr = 0; ng = 0; nb = 255;
+          } else {
+            // Verd o blau dominants (o empat) -> pot vermell.
+            nr = 255; ng = 0; nb = 0;
+          }
+          if (nr == id(pot_r) && ng == id(pot_g) && nb == id(pot_b)) return;
+          id(pot_r) = nr;
+          id(pot_g) = ng;
+          id(pot_b) = nb;
+          auto call = id(cactus_test).turn_on();
+          call.set_rgb((float)nr / 255.0f,
+                       (float)ng / 255.0f,
+                       (float)nb / 255.0f);
+          call.set_transition_length(0);
+          call.perform();
+    effects:
+      # Degradat al tronc (100%->70%) i braços al 100%, agafant el color
+      # actual de la llum Planta (via current_color). Aixi l'usuari pot
+      # canviar el color des de HA (color picker) i el degradat es fa amb
+      # el nou color, mantenint la forma. Fallback: verd si tot 0.
+      # Ambilight: color pla del stream (ja amb la brillantor aplicada), refrescat a 60 Hz.
+      - addressable_lambda:
+          name: "Ambilight"
+          update_interval: 16ms
+          lambda: |-
+            it.all() = Color((uint8_t) (id(amb_r) * 255.0f), (uint8_t) (id(amb_g) * 255.0f),
+                             (uint8_t) (id(amb_b) * 255.0f));
+      - addressable_lambda:
+          name: "Planta Gradient"
+          update_interval: 33ms
+          lambda: |-
+            const int N = (int)it.size();
+            const int TRUNK_N = ${light_A_leds_tronc};
+            uint8_t R = current_color.red;
+            uint8_t G = current_color.green;
+            uint8_t B = current_color.blue;
+            // Fallback si mai s'ha triat color: verd pur.
+            if (R == 0 && G == 0 && B == 0) { G = 255; }
+            // Tronc: primers 42 LEDs, degradat 100% (dalt) -> 70% (baix).
+            for (int i = 0; i < TRUNK_N && i < N; i++) {
+              float bright = 1.0f - (float)i / 41.0f * 0.3f;
+              it[i] = Color((uint8_t)(R * bright),
+                            (uint8_t)(G * bright),
+                            (uint8_t)(B * bright));
+            }
+            // Braços: la resta al 100% (color pla).
+            for (int i = TRUNK_N; i < N; i++) {
+              it[i] = Color(R, G, B);
+            }
+
+script:
+  # Aplica l'estat de l'endpoint Hue 11 (on/off, nivell, color en HS, XY o CT) a les 4 particions alhora.
+  - id: hue_render
+    mode: restart
+    then:
+      - lambda: |-
+          if (id(amb_active)) return;  // mentre hi ha Ambilight, el cos el pinta el stream
+          float r = 1, g = 1, b = 1;
+          if (id(hue_mode) == 1) {
+            r = zigbee::get_r_from_xy(id(hue_x), id(hue_y));
+            g = zigbee::get_g_from_xy(id(hue_x), id(hue_y));
+            b = zigbee::get_b_from_xy(id(hue_x), id(hue_y));
+          } else if (id(hue_mode) == 2) {
+            // Mireds -> RGB (aproximacio de Tanner Helland, 1000..40000 K)
+            float mired = id(hue_ct) < 153 ? 153 : (id(hue_ct) > 500 ? 500 : id(hue_ct));
+            float t = 10000.0f / mired;   // kelvin / 100
+            r = t <= 66 ? 1.0f : 329.698727446f * powf(t - 60, -0.1332047592f) / 255.0f;
+            g = t <= 66 ? (99.4708025861f * logf(t) - 161.1195681661f) / 255.0f
+                        : 288.1221695283f * powf(t - 60, -0.0755148492f) / 255.0f;
+            b = t >= 66 ? 1.0f : (t <= 19 ? 0.0f : (138.5177312231f * logf(t - 10) - 305.0447927307f) / 255.0f);
+          } else {
+            // HSV -> RGB (V = 1; el nivell va per brightness)
+            float h = id(hue_h) * 6.0f, sat = id(hue_s);
+            int i = (int) h % 6;
+            float f = h - (int) h, pp = 1 - sat, q = 1 - sat * f, tt = 1 - sat * (1 - f);
+            switch (i) { case 0: r = 1; g = tt; b = pp; break; case 1: r = q; g = 1; b = pp; break;
+                         case 2: r = pp; g = 1; b = tt; break; case 3: r = pp; g = q; b = 1; break;
+                         case 4: r = tt; g = pp; b = 1; break; default: r = 1; g = pp; b = q; break; }
+          }
+          auto clamp01 = [](float v) { return v < 0 ? 0.0f : (v > 1 ? 1.0f : v); };
+          r = clamp01(r); g = clamp01(g); b = clamp01(b);
+          // MODE HUE: la primera ordre Hue pren el cos del cactus. Planta (tronc + bracos) queda encesa amb l'efecte
+          // "Planta Gradient" despres de cactus_create i reescriu els LEDs cada 33 ms: si no l'apaguem, nomes el pot
+          // (cactus_test) segueix l'app (vist el 2026-10-11). Tambe aturem els efectes dels strips crus si en queda cap.
+          if (!id(hue_body_mode)) {
+            id(hue_body_mode) = true;
+            ESP_LOGI("hue_mode", "Mode Hue: el cos del cactus passa a l'estat Hue (planta i efectes aturats)");
+            auto off_planta = id(planta).turn_off(); off_planta.set_transition_length(0); off_planta.perform();
+            if (id(strip_tronc).current_values.is_on()) {
+              auto c = id(strip_tronc).turn_off(); c.set_transition_length(0); c.perform();
+            }
+            if (id(strip_brac).current_values.is_on()) {
+              auto c = id(strip_brac).turn_off(); c.set_transition_length(0); c.perform();
+            }
+          }
+          const float bri = id(hue_level) < 0.004f ? 0.004f : id(hue_level);
+          for (auto *l : {id(cactus_tronc), id(cactus_brac_adalt), id(cactus_brac_abaix)}) {
+            auto call = l->make_call();
+            call.set_state(id(hue_on));
+            if (id(hue_on)) {
+              call.set_brightness(bri);
+              call.set_rgb(r, g, b);
+            }
+            call.perform();
+          }
+          // Pot (cactus_test): color antagonic al dominant del cos (mateixa regla que planta.on_state), amb la
+          // brillantor de la Hue; apagat quan la Hue esta apagada.
+          {
+            uint8_t nr, ng, nb;
+            if (r > g && r > b) { nr = 0; ng = 0; nb = 255; } else { nr = 255; ng = 0; nb = 0; }
+            id(pot_r) = nr; id(pot_g) = ng; id(pot_b) = nb;
+            auto call = id(cactus_test).make_call();
+            call.set_state(id(hue_on));
+            if (id(hue_on)) {
+              call.set_brightness(bri);
+              call.set_rgb(nr / 255.0f, ng / 255.0f, nb / 255.0f);
+            }
+            call.perform();
+          }
+
+  # Creixement del cactus (60s) + estat final amb colors per particio.
+  - id: cactus_create
+    mode: restart
+    then:
+      - lambda: "id(hue_body_mode) = false; id(amb_blocked) = true;"  # l'efecte repren el cos (i talla l'Ambilight)
+      # Apaguem TOTES les particions (incloent planta) perque no discutin
+      # amb els raw effects i el color del script (verd per defecte) sigui
+      # el que mana al final.
+      - light.turn_off:
+          id: planta
+          transition_length: 0s
+      - light.turn_off:
+          id: cactus_tronc
+          transition_length: 0s
+      - light.turn_off:
+          id: cactus_test
+          transition_length: 0s
+      - light.turn_off:
+          id: cactus_brac_adalt
+          transition_length: 0s
+      - light.turn_off:
+          id: cactus_brac_abaix
+          transition_length: 0s
+      - lambda: id(cactus_start_ms) = millis();
+      # NOTA: no podem combinar effect + transition_length al mateix
+      # light.turn_on (grup d'exclusio 'transformer'). Baixem els
+      # default_transition_length dels raw strips a 0s en canvi.
+      - light.turn_on:
+          id: strip_tronc
+          effect: "Cactus Create"
+      - light.turn_on:
+          id: strip_brac
+          effect: "Cactus Create"
+      # Creixença 52 steps * ${step_ms}ms + 200ms de marge.
+      - delay: !lambda "return 52 * ${step_ms} + 200;"
+      # Aturem els raws.
+      - light.turn_off:
+          id: strip_tronc
+          transition_length: 0s
+      - light.turn_off:
+          id: strip_brac
+          transition_length: 0s
+      # Petit marge per assegurar que el raw strip ha alliberat el buffer
+      # abans de comencar a escriure des de particions.
+      - delay: 50ms
+      # Estat final:
+      #   - planta (tronc + braços): verd per defecte amb effect
+      #     "Planta Gradient" (degradat 100%->70% al tronc, braços 100%).
+      #   - pot (cactus_test): vermell explicit. S'escriu DESPRES de planta
+      #     perque l'ultima escriptura al buffer sigui la del pot i no la
+      #     puguin sobreescriure els triggers derivats de planta.on_state.
+      # Les particions individuals cactus_tronc/brac_adalt/brac_abaix
+      # queden APAGADES al final; l'usuari pot obrir-les manualment si
+      # vol control per zones (fara fight amb planta, ultima ordre guanya).
+      # Si l'usuari canvia el color de planta a HA -> tot el cos del
+      # cactus s'actualitza amb el nou color, degradat inclos, i el pot
+      # segueix la regla antagonica (on_state de planta).
+      - lambda: |-
+          // Planta verda amb gradient primer.
+          auto call_g = id(planta).turn_on();
+          call_g.set_rgb(0.0f, 1.0f, 0.0f);
+          call_g.set_brightness(1.0f);
+          call_g.set_transition_length(0);
+          call_g.perform();
+          auto call_e = id(planta).turn_on();
+          call_e.set_effect("Planta Gradient");
+          call_e.perform();
+      # Delay curt perque planta arranqui l'effect i actualitzi el buffer
+      # del tronc; despres reencenem el pot com a darrera operacio.
+      - delay: 50ms
+      - lambda: |-
+          // Pot vermell explicit, com a ultima escriptura al buffer.
+          id(pot_r) = 255;
+          id(pot_g) = 0;
+          id(pot_b) = 0;
+          auto call_pot = id(cactus_test).turn_on();
+          call_pot.set_rgb(1.0f, 0.0f, 0.0f);
+          call_pot.set_brightness(1.0f);
+          call_pot.set_transition_length(0);
+          call_pot.perform();
+
+  # Helper: executa un cicle de "Lightning Rain" amb els parametres definits
+  # per lr_level (1..3) i lr_direction (0=up, 1=down). No modifica els
+  # globals; els assumeix ja fixats pel caller.
+  - id: cactus_lightning_rain_run
+    mode: single
+    then:
+      - lambda: "id(hue_body_mode) = false; id(amb_blocked) = true;"  # l'efecte repren el cos (i talla l'Ambilight)
+      - light.turn_off:
+          id: planta
+          transition_length: 0s
+      - light.turn_off:
+          id: cactus_tronc
+          transition_length: 0s
+      - light.turn_off:
+          id: cactus_brac_adalt
+          transition_length: 0s
+      - light.turn_off:
+          id: cactus_brac_abaix
+          transition_length: 0s
+      - lambda: id(cactus_start_ms) = millis();
+      - light.turn_on:
+          id: strip_tronc
+          effect: "Lightning Rain"
+      - light.turn_on:
+          id: strip_brac
+          effect: "Lightning Rain"
+      # Duracio = prop_ms (front al tronc + brac mes llarg) +
+      #           (num_strikes-1) * restrike_gap + 3.5 * decay_tau + marge.
+      # L1: 220 + 0 + 3.5*240 = 1060. L2: 100 + 220 + 3.5*160 = 880.
+      # L3: 45 + 3*75 + 3.5*90 = 585.  Marge per cua i brac -> 1200 / 1000 / 750.
+      - delay: !lambda |-
+          uint8_t l = id(lr_level);
+          if (l <= 1) return 1200;
+          if (l == 2) return 1000;
+          return 750;
+      - light.turn_off:
+          id: strip_tronc
+          transition_length: 0s
+      - light.turn_off:
+          id: strip_brac
+          transition_length: 0s
+      # Restaura "mode llum" (planta verd amb gradient). El pot s'actualitza
+      # automaticament via l'on_state de Planta (R=0 -> pot vermell).
+      - lambda: |-
+          auto call_g = id(planta).turn_on();
+          call_g.set_rgb(0.0f, 1.0f, 0.0f);
+          call_g.set_transition_length(0);
+          call_g.perform();
+          auto call_e = id(planta).turn_on();
+          call_e.set_effect("Planta Gradient");
+          call_e.perform();
+
+  # 6 scripts nomenats: cadascun fixa (lr_level, lr_direction) i delega al
+  # helper. Es criden 1 cop a on_boot en parells (up_N, down_N), 2s entre
+  # parells. Nivell 1 = fluix, 3 = exagerat.
+  - id: cactus_lightning_rain_up_1
+    mode: single
+    then:
+      - lambda: |-
+          id(lr_level) = 1;
+          id(lr_direction) = 0;
+      - script.execute: cactus_lightning_rain_run
+      - script.wait: cactus_lightning_rain_run
+
+  - id: cactus_lightning_rain_down_1
+    mode: single
+    then:
+      - lambda: |-
+          id(lr_level) = 1;
+          id(lr_direction) = 1;
+      - script.execute: cactus_lightning_rain_run
+      - script.wait: cactus_lightning_rain_run
+
+  - id: cactus_lightning_rain_up_2
+    mode: single
+    then:
+      - lambda: |-
+          id(lr_level) = 2;
+          id(lr_direction) = 0;
+      - script.execute: cactus_lightning_rain_run
+      - script.wait: cactus_lightning_rain_run
+
+  - id: cactus_lightning_rain_down_2
+    mode: single
+    then:
+      - lambda: |-
+          id(lr_level) = 2;
+          id(lr_direction) = 1;
+      - script.execute: cactus_lightning_rain_run
+      - script.wait: cactus_lightning_rain_run
+
+  - id: cactus_lightning_rain_up_3
+    mode: single
+    then:
+      - lambda: |-
+          id(lr_level) = 3;
+          id(lr_direction) = 0;
+      - script.execute: cactus_lightning_rain_run
+      - script.wait: cactus_lightning_rain_run
+
+  - id: cactus_lightning_rain_down_3
+    mode: single
+    then:
+      - lambda: |-
+          id(lr_level) = 3;
+          id(lr_direction) = 1;
+      - script.execute: cactus_lightning_rain_run
+      - script.wait: cactus_lightning_rain_run
+
+  # ================================================================
+  # Efectes creatius del tronc (Rain Drops, Breathing Aurora,
+  # Sparkle Twinkle, Fire Rise). Nomes strip_tronc; strip_brac apagat.
+  # El caller ha de fixar lr_level (i lr_direction si aplica) abans.
+  # ================================================================
+
+  # Prep comu: apaga totes les particions i strip_brac, marca t0.
+  - id: cactus_fx_prep
+    mode: single
+    then:
+      - light.turn_off:
+          id: planta
+          transition_length: 0s
+      - light.turn_off:
+          id: cactus_tronc
+          transition_length: 0s
+      - light.turn_off:
+          id: cactus_test
+          transition_length: 0s
+      - light.turn_off:
+          id: cactus_brac_adalt
+          transition_length: 0s
+      - light.turn_off:
+          id: cactus_brac_abaix
+          transition_length: 0s
+      - light.turn_off:
+          id: strip_brac
+          transition_length: 0s
+      - lambda: id(cactus_start_ms) = millis();
+
+  # Restore comu: apaga strip_tronc i torna a "mode llum" (planta verd
+  # amb Planta Gradient + pot vermell explicit com a darrera escriptura).
+  - id: cactus_fx_restore
+    mode: single
+    then:
+      - light.turn_off:
+          id: strip_tronc
+          transition_length: 0s
+      - delay: 50ms
+      - lambda: |-
+          auto call_g = id(planta).turn_on();
+          call_g.set_rgb(0.0f, 1.0f, 0.0f);
+          call_g.set_brightness(1.0f);
+          call_g.set_transition_length(0);
+          call_g.perform();
+          auto call_e = id(planta).turn_on();
+          call_e.set_effect("Planta Gradient");
+          call_e.perform();
+      - delay: 50ms
+      - lambda: |-
+          id(pot_r) = 255;
+          id(pot_g) = 0;
+          id(pot_b) = 0;
+          auto call_pot = id(cactus_test).turn_on();
+          call_pot.set_rgb(1.0f, 0.0f, 0.0f);
+          call_pot.set_brightness(1.0f);
+          call_pot.set_transition_length(0);
+          call_pot.perform();
+
+  - id: cactus_rain_run
+    mode: single
+    then:
+      - script.execute: cactus_fx_prep
+      - script.wait: cactus_fx_prep
+      - light.turn_on:
+          id: strip_tronc
+          effect: "Rain Drops"
+      - delay: 8s
+      - script.execute: cactus_fx_restore
+      - script.wait: cactus_fx_restore
+
+  - id: cactus_aurora_run
+    mode: single
+    then:
+      - lambda: "id(hue_body_mode) = false; id(amb_blocked) = true;"  # l'efecte repren el cos (i talla l'Ambilight)
+      - script.execute: cactus_fx_prep
+      - script.wait: cactus_fx_prep
+      - light.turn_on:
+          id: strip_tronc
+          effect: "Breathing Aurora"
+      - delay: 12s
+      - script.execute: cactus_fx_restore
+      - script.wait: cactus_fx_restore
+
+  - id: cactus_sparkle_run
+    mode: single
+    then:
+      - lambda: "id(hue_body_mode) = false; id(amb_blocked) = true;"  # l'efecte repren el cos (i talla l'Ambilight)
+      - script.execute: cactus_fx_prep
+      - script.wait: cactus_fx_prep
+      - light.turn_on:
+          id: strip_tronc
+          effect: "Sparkle Twinkle"
+      - delay: 8s
+      - script.execute: cactus_fx_restore
+      - script.wait: cactus_fx_restore
+
+  - id: cactus_fire_run
+    mode: single
+    then:
+      - lambda: "id(hue_body_mode) = false; id(amb_blocked) = true;"  # l'efecte repren el cos (i talla l'Ambilight)
+      - script.execute: cactus_fx_prep
+      - script.wait: cactus_fx_prep
+      - light.turn_on:
+          id: strip_tronc
+          effect: "Fire Rise"
+      - delay: 10s
+      - script.execute: cactus_fx_restore
+      - script.wait: cactus_fx_restore
+
+  - id: cactus_foc_pot_run
+    mode: single
+    then:
+      - lambda: "id(hue_body_mode) = false; id(amb_blocked) = true;"  # l'efecte repren el cos (i talla l'Ambilight)
+      - script.execute: cactus_fx_prep
+      - script.wait: cactus_fx_prep
+      - light.turn_on:
+          id: strip_tronc
+          effect: "Foc Pot"
+      - delay: 12s
+      - script.execute: cactus_fx_restore
+      - script.wait: cactus_fx_restore
+
+  - id: cactus_glacial_run
+    mode: single
+    then:
+      - lambda: "id(hue_body_mode) = false; id(amb_blocked) = true;"  # l'efecte repren el cos (i talla l'Ambilight)
+      - script.execute: cactus_fx_prep
+      - script.wait: cactus_fx_prep
+      - light.turn_on:
+          id: strip_tronc
+          effect: "Glacial"
+      - delay: 15s
+      - script.execute: cactus_fx_restore
+      - script.wait: cactus_fx_restore
+
+  - id: cactus_ronvv_run
+    mode: single
+    then:
+      - lambda: "id(hue_body_mode) = false; id(amb_blocked) = true;"  # l'efecte repren el cos (i talla l'Ambilight)
+      - script.execute: cactus_fx_prep
+      - script.wait: cactus_fx_prep
+      - light.turn_on:
+          id: strip_tronc
+          effect: "RONVV"
+      - delay: 12s
+      - script.execute: cactus_fx_restore
+      - script.wait: cactus_fx_restore
+
+  # Sequencia: create -> create -> mode llum. Nomes creixement (2 execucions
+  # de cactus_create, sense disappears intermedi). El darrer cactus_create
+  # acaba amb el paint final (pot vermell + planta verd amb Planta Gradient),
+  # que es l'estat "mode llum" ajustable per l'usuari.
+  - id: cactus_loop
+    mode: single
+    then:
+      - script.execute: cactus_create
+      - script.wait: cactus_create
+      - script.execute: cactus_create
+      - script.wait: cactus_create
+
+  # Decideix el mode de connectivitat a partir dels 2 switches.
+  # wifi==zb (on+on o off+off): comportament classic (finestra + handoff Zigbee).
+  # wifi only: WiFi indefinida, Zigbee no arrenca.
+  # zb only: WiFi off, Zigbee arrenca de seguida.
+  - id: apply_connectivity
+    mode: single
+    then:
+      # Finestra WiFi a cada arrencada (OTA remota): mode combinat = WiFi ON + Zigbee ON. Migracio unica perque els
+      # switches persistits (abans forcats a WiFi OFF / Zigbee ON) no ho impedeixin. Va aqui (prioritat -100) i no a
+      # on_boot 800: alla els switches encara no han restaurat l'estat de NVS i el turn_on quedava trepitjat.
+      - if:
+          condition:
+            lambda: "return id(conn_cfg_version) < 2;"
+          then:
+            - logger.log: "Migracio connectivitat v2: WiFi ON + Zigbee ON (finestra WiFi ${wifi_window} i despres Zigbee)"
+            - switch.turn_on: sw_wifi_enabled
+            - switch.turn_on: sw_zigbee_enabled
+            - lambda: id(conn_cfg_version) = 2;
+      - lambda: |-
+          bool w = id(sw_wifi_enabled).state;
+          bool z = id(sw_zigbee_enabled).state;
+
+          ESP_LOGI("conn", "arrancada: wifi_enabled=%d zigbee_enabled=%d", w, z);
+      - if:
+          condition:
+            lambda: "return id(sw_wifi_enabled).state == id(sw_zigbee_enabled).state;"
+          then:
+            - logger.log: "Mode combinat: finestra WiFi -> Zigbee"
+            - script.execute: wifi_window_script
+          else:
+            - if:
+                condition:
+                  lambda: "return id(sw_wifi_enabled).state;"
+                then:
+                  - logger.log: "Mode sols WiFi: Zigbee no s'arrancara"
+                else:
+                  - logger.log: "Mode sols Zigbee: apagant WiFi i arrancant Zigbee"
+                  - script.execute: switch_to_zigbee
+
+  - id: wifi_window_script
+    mode: single
+    then:
+      - delay: ${wifi_window}
+      - if:
+          condition:
+            lambda: "return !id(ota_active);"
+          then:
+            - script.execute: switch_to_zigbee
+          else:
+            - logger.log: "OTA en curso: la ventana WiFi sigue abierta"
+
+  - id: switch_to_zigbee
+    mode: single
+    then:
+      - logger.log: "Fin de la ventana WiFi: apagando WiFi y arrancando Zigbee"
+      - lambda: id(zb_mode) = true;
+      - wifi.disable:
+      # Marge per alliberar la radio 2.4GHz abans d'iniciar el steering Zigbee.
+      - delay: 2s
+      - zigbee.start: zb
+
+  # Torna al mode WiFi (WiFi ON, Zigbee OFF) i reinicia perque els switches
+  # es llegeixen a boot. Es pot cridar via API (run_switch_to_wifi), boto HA
+  # ("WiFi mode") o Zigbee (recall scene_id=5). Aquesta ultima es l'unica via
+  # remota si el device ja esta en Zigbee-only i WiFi apagat.
+  - id: switch_to_wifi
+    mode: single
+    then:
+      - logger.log: "Bootstrap: WiFi ON, Zigbee OFF (reinici imminent)"
+      - switch.turn_on: sw_wifi_enabled
+      - switch.turn_off: sw_zigbee_enabled
+      # Marge per persistir l'estat dels switches a NVS abans del reboot.
+      - delay: 500ms
+      - lambda: App.safe_reboot();
+
+  # Triggers "BYWIFI" / "BYZIGBEE". Fixen els switches i esperen 5s per
+  # garantir la persistencia a NVS abans de reiniciar. mode: restart per si
+  # es dispara mes d'un cop (l'ultima crida guanya).
+  - id: boot_by_wifi
+    mode: restart
+    then:
+      - logger.log: "BYWIFI: preparant boot WiFi (5s per persistir NVS)"
+      - switch.turn_on: sw_wifi_enabled
+      - switch.turn_off: sw_zigbee_enabled
+      - delay: 5s
+      - lambda: App.safe_reboot();
+
+  - id: boot_by_zigbee
+    mode: restart
+    then:
+      - logger.log: "BYZIGBEE: preparant boot Zigbee (5s per persistir NVS)"
+      - switch.turn_off: sw_wifi_enabled
+      - switch.turn_on: sw_zigbee_enabled
+      - delay: 5s
+      - lambda: App.safe_reboot();
+
+switch:
+  - platform: template
+    name: "WiFi enabled"
+    id: sw_wifi_enabled
+    icon: mdi:wifi
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_on:
+      - logger.log: "WiFi enabled ON (efectiu al proxim reinici)"
+    on_turn_off:
+      - logger.log: "WiFi enabled OFF (efectiu al proxim reinici)"
+
+  - platform: template
+    name: "Zigbee enabled"
+    id: sw_zigbee_enabled
+    icon: mdi:zigbee
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_on:
+      - logger.log: "Zigbee enabled ON (efectiu al proxim reinici)"
+    on_turn_off:
+      - logger.log: "Zigbee enabled OFF (efectiu al proxim reinici)"
+
+  # Triggers de canvi de mode. Sempre boot OFF (restore_mode ALWAYS_OFF), no
+  # persisteixen a NVS. En encendre'ls, es dispara el script que fixa
+  # sw_wifi/sw_zigbee correctament, espera 5s per persistir NVS, i reinicia.
+  # Exposats tambe com a llums Zigbee (ep 7, 8) per poder-los disparar quan
+  # el device esta en Zigbee-only sense WiFi.
+  - platform: template
+    name: "BYWIFI"
+    id: sw_by_wifi
+    icon: mdi:wifi-arrow-up-down
+    entity_category: config
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    on_turn_on:
+      - script.execute: boot_by_wifi
+
+  - platform: template
+    name: "BYZIGBEE"
+    id: sw_by_zigbee
+    icon: mdi:zigbee
+    entity_category: config
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    on_turn_on:
+      - script.execute: boot_by_zigbee
+
+button:
+  - platform: template
+    name: "Cactus Create"
+    icon: mdi:sprout
+    on_press:
+      - script.execute: cactus_loop
+  - platform: template
+    name: "Foc Pot"
+    icon: mdi:fire
+    on_press:
+      - script.execute: cactus_foc_pot_run
+  - platform: template
+    name: "Glacial"
+    icon: mdi:snowflake
+    on_press:
+      - script.execute: cactus_glacial_run
+  - platform: template
+    name: "RONVV"
+    icon: mdi:palette
+    on_press:
+      - script.execute: cactus_ronvv_run
+  - platform: template
+    name: "WiFi mode (reboot)"
+    icon: mdi:wifi-refresh
+    entity_category: config
+    on_press:
+      - script.execute: switch_to_wifi
+  - platform: template
+    name: "Zigbee Reset - Re-pair"
+    icon: mdi:zigbee
+    entity_category: diagnostic
+    on_press:
+      - logger.log: "Zigbee reset: oblidant xarxa"
+      - zigbee.reset: zb
+  - platform: restart
+    name: "Reset"
+    icon: mdi:restart
+    entity_category: diagnostic
+
+# ------------------------------ Zigbee ------------------------------
+# 4 endpoints COLOR_DIMMABLE_LIGHT (1..4) per control de color/brillantor
+# per particio + 2 endpoints ON_OFF_OUTPUT (5,6) per als switches
+# WiFi/Zigbee enabled. SENSE mode (0xF001) ni escenes.
+huewejnorg:
+  id: zb
+  # PERFIL HUE COMPLET (decisio de l'usuari: "ha de passar per una Hue a tots els nivells"). Es presenta com una
+  # Hue White and Color Ambiance A19 (LCT015) de Signify:
+  #   IEEE        00:17:88:01:... (OUI Philips/Signify)          -> mac
+  #   Node desc.  manufacturer code 0x100B, router, cap 0x8E      -> manufacturer_code, router: true
+  #   Basic       "Signify Netherlands B.V." / "LCT015", ZCL 1, app 2, stack 1, hw 1, date, SWBuildID
+  #   Endpoint    11, HA 0x0104, Extended Color Light 0x010D, app_device_version 1
+  #   Clusters    Basic, Identify, Groups, Scenes, OnOff, Level, Color (xy + CT + HS, capabilities 0x1F)
+  # Valors presos de signatures publiques de l'LCT015 (ZHA/Z2M); si el pont encara el fa fora, comparar amb una
+  # captura d'una Hue real. No hi ha: Touchlink (0x1000), cluster propietari 0xFC0x, client OTA (0x0019) ni
+  # l'endpoint 242 de Green Power.
+  name: "LCT015"
+  manufacturer: "Signify Netherlands B.V."
+  manufacturer_code: 0x100B
+  zcl_version: 1
+  stack_version: 1
+  hw_version: 1
+  date: "20181120"
+  sw_build_id: "1.116.12"   # com les LCT015 reals del pont (captura 2026-10-11); amb 1.50.2 el pont no fa el cami Hue
+  ident_time: 0
+  # IEEE amb l OUI de Philips/Signify (00:17:88) i prefix 01 com les Hue reals.
+  # Els 4 ultims bytes CA:FE:00:0x no apareixen a cap captura: evita col.lidir amb una bombeta real.
+  # :04 des del 2026-09-29: identitat nova perque el pont no arrossegui res de les 4 unions rebutjades amb :03.
+  # :06 des del 2026-10-11 14:20 (emulacio Hue): identitat nova, el pont havia esborrat la :04 tres vegades. La :05 queda
+  # reservada per a la placa definitiva (la dels LEDs).
+  # :07 (14:40): el pont va ignorar la :06 despres de l entrevista tallada de les 14:25 (cada intent fallit crema una IEEE).
+  # :08 (14:55): la :07 va arribar al cami Hue pero el pont la va fer fora (Default Response sense codi de fabricant).
+  # :09 (15:25): la :08 tambe va caure a la 0xC0 (el handler no responia amb "disable default response").
+  # :09 = identitat donada d alta al pont Hue el 2026-10-11 15:27 (unica placa de moment; cactushuev1.yaml).
+  mac: "00:17:88:01:CA:FE:00:09"
+  version: 2   # Basic ApplicationVersion (com l'LCT015)
+  # Canal Zigbee. Opcions (comenta/descomenta segons cal):
+  #   - Un canal fixat (via substitucio ${hue_channel}): mes rapid
+  #   - Llista Hue-preferits (comentar la linia de dalt i descomentar aixo):
+  #       channel: [11, 15, 20, 25]
+  #   - Escaneig complet (debug):
+  #       channel: [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]
+  channel: 11
+  debug: false   # router + debug (zboss trace lib) no cap a app0 (104,5 %): el sniffer zigbeelogger substitueix les traces
+  power_supply: 1
+  # router: true com les bombetes Hue reals (Association Request cap=0x8E: FFD, mains, rxOnIdle).
+  router: true
+  manual_start: true
+  # Emulacio Hue (components/huewejnorg/hue_emu.h, captura del 2026-10-11): descriptor simple ZLL
+  # 0xC05E / Extended Color Light 0x0210 / v2, clusters 0xFC01, 0xFC03, 0xFC04 i Touchlink 0x1000, atributs de
+  # fabricant 0x100B (Basic 0x0020/0x0021/0x0053/0x0054, Identify, Level, Scenes), gamut al Color, l'estat compacte
+  # Hue (0xFC03 attr 0x0002) i les comandes Hue (0xFC03 cmd 0x00 i Scenes manuf cmd 0x02 = guardar escena).
+  hue_emulation: true
+  hue_endpoint: 11
+  # ZLL Commissioning Trust Center link key del Hue Bridge.
+  # NOTA: no es la default publica ZigBeeAlliance09; la 9F:55:95:F1:... es la clau de certificacio/desenvolupament.
+  # join_mode distributed: la clau va al slot DISTRIBUIT (dTCLK) i s'habilita el join a xarxes distribuides,
+  # que es el que es el Hue Bridge. Amb centralized la pila rebutjava la Transport Key ("encrypted by dTCLK 0").
+  join_mode: distributed
+  # TEMPORAL (depuracio): en unir-se escriu la clau de xarxa al log per carregar-la al sniffer zigbeelogger
+  # (accio set_nwk_key) i desxifrar l'entrevista del pont. Tornar-ho a false quan s'acabi.
+  log_network_key: true
+  #trust_center_key: "0x81, 0x42, 0x86, 0x86, 0x5D, 0xC1, 0xC8, 0xB2, 0xC8, 0xCB, 0xC5, 0x2E, 0x5D, 0x65, 0xD1, 0xB8"
+  trust_center_key: "0x81, 0x42, 0x86, 0x86, 0x5D, 0xC1, 0xC8, 0xB2, 0xC8, 0xCB, 0xC5, 0x2E, 0x5D, 0x65, 0xD1, 0xB8"
+  on_join:
+    - then:
+        - logger.log: "Zigbee joined (perfil Hue LCT015, endpoint 11)"
+
+  # Dispatch d'accions per scene_id (recall scene des de HA / coordinator):
+  #   1 = Cactus Create (creixement)
+  #   2 = Foc Pot (foc pujant des del pot)
+  #   3 = Glacial (gel cristal.li)
+  #   4 = RONVV (taronja-vermell-violeta)
+  #   5 = Torna a mode WiFi (switch_to_wifi, reinicia el device)
+  # scene_group s'ignora (accepta qualsevol grup).
+  on_recall_scene:
+    - then:
+        - lambda: |-
+            ESP_LOGI("zb_scene", "recall scene: group=%u id=%u", scene_group, scene_id);
+        # Amb el pont Hue (grups 0x76C0, 0x7731...) l'escena es un estat guardat a la taula de la pila i s'aplica sol;
+        # els efectes per scene_id nomes per a recalls amb grup 0 (HA/ZHA), si no el pont engegaria "Cactus Create"
+        # cada cop que recorda l'escena 1.
+        - if:
+            condition:
+              lambda: "return scene_group == 0 && scene_id == 1;"
+            then:
+              - script.execute: cactus_loop
+        - if:
+            condition:
+              lambda: "return scene_group == 0 && scene_id == 2;"
+            then:
+              - script.execute: cactus_foc_pot_run
+        - if:
+            condition:
+              lambda: "return scene_group == 0 && scene_id == 3;"
+            then:
+              - script.execute: cactus_glacial_run
+        - if:
+            condition:
+              lambda: "return scene_group == 0 && scene_id == 4;"
+            then:
+              - script.execute: cactus_ronvv_run
+        - if:
+            condition:
+              lambda: "return scene_group == 0 && scene_id == 5;"
+            then:
+              - script.execute: switch_to_wifi
+  endpoints:
+    # ---- ep 11: la "bombeta" Hue. Tots els estats van a globals hue_* i el script hue_render els aplica a les
+    #      4 particions (tronc, test, brac adalt, brac abaix). Les escenes (on_recall_scene) segueixen funcionant.
+    - num: 11
+      device_type: EXTENDED_COLOR_LIGHT
+      clusters:
+        - id: ON_OFF
+          attributes:
+            - attribute_id: 0
+              type: bool
+              on_value:
+                then:
+                  - lambda: id(hue_on) = (bool) x;
+                  - script.execute: hue_render
+            # Off with effect / arrencada, com una Hue
+            - attribute_id: 0x4000 # GlobalSceneControl
+              type: bool
+              value: true
+            - attribute_id: 0x4001 # OnTime
+              type: U16
+              value: 0
+            - attribute_id: 0x4002 # OffWaitTime
+              type: U16
+              value: 0
+            - attribute_id: 0x4003 # StartUpOnOff (1 = on)
+              type: 8BIT_ENUM
+              value: 1
+        - id: LEVEL_CONTROL
+          attributes:
+            - attribute_id: 0
+              type: U8
+              value: 254
+              on_value:
+                then:
+                  - lambda: id(hue_level) = (float) x / 254.0f;
+                  - script.execute: hue_render
+            - attribute_id: 0x4000 # StartUpCurrentLevel
+              type: U8
+              value: 254
+        - id: COLOR_CONTROL
+          attributes:
+            - attribute_id: 0x0000 # CurrentHue
+              type: U8
+              value: 0
+              on_value:
+                then:
+                  - lambda: |-
+                      id(hue_h) = (float) x / 254.0f;
+                      id(hue_mode) = 0;
+                  - script.execute: hue_render
+            - attribute_id: 0x0001 # CurrentSaturation
+              type: U8
+              value: 0
+              on_value:
+                then:
+                  - lambda: |-
+                      id(hue_s) = (float) x / 254.0f;
+                      id(hue_mode) = 0;
+                  - script.execute: hue_render
+            - attribute_id: 0x0003 # CurrentX
+              type: U16
+              value: 20493
+              on_value:
+                then:
+                  - lambda: |-
+                      id(hue_x) = (float) x / 65536.0f;
+                      id(hue_mode) = 1;
+                  - script.execute: hue_render
+            - attribute_id: 0x0004 # CurrentY
+              type: U16
+              value: 21561
+              on_value:
+                then:
+                  - lambda: |-
+                      id(hue_y) = (float) x / 65536.0f;
+                      id(hue_mode) = 1;
+                  - script.execute: hue_render
+            - attribute_id: 0x0007 # ColorTemperatureMireds
+              type: U16
+              value: 366
+              on_value:
+                then:
+                  - lambda: |-
+                      id(hue_ct) = (float) x;
+                      id(hue_mode) = 2;
+                  - script.execute: hue_render
+            - attribute_id: 0x0008 # ColorMode (0 HS, 1 XY, 2 CT)
+              type: 8BIT_ENUM
+              value: 2
+            - attribute_id: 0x4001 # EnhancedColorMode
+              type: 8BIT_ENUM
+              value: 2
+            - attribute_id: 0x400A # ColorCapabilities: HS | EnhancedHue | ColorLoop | XY | CT
+              type: 16BITMAP
+              value: 0x001F
+            - attribute_id: 0x400B # ColorTempPhysicalMinMireds (6500 K)
+              type: U16
+              value: 153
+            - attribute_id: 0x400C # ColorTempPhysicalMaxMireds (2000 K)
+              type: U16
+              value: 500
+            - attribute_id: 0x4010 # StartUpColorTemperatureMireds
+              type: U16
+              value: 366
+
+interval:
+  # Ambilight + Hue: calcula el color del stream (main loop; la tasca Zigbee nomes escriu numeros) i fa els canvis de
+  # mode. Els efectes "Ambilight" (planta) i "Ambilight Pot" (cactus_test) pinten els LEDs.
+  - interval: 33ms
+    then:
+      - lambda: |-
+          const bool act = esphome_hue_ent_active(1000);
+          if (!act) {
+            if (id(amb_active)) {
+              id(amb_active) = false;
+              ESP_LOGI("ambilight", "Ambilight OFF: torna a l'estat Hue");
+              auto p = id(planta).turn_off(); p.set_transition_length(0); p.perform();
+              auto t = id(cactus_test).turn_on(); t.set_effect("None"); t.set_transition_length(0); t.perform();
+              id(hue_body_mode) = true;
+              id(hue_render).execute();
+            }
+            id(amb_blocked) = false;
+            return;
+          }
+          if (id(amb_blocked)) { id(amb_active) = false; return; }
+          float bri = 0, x = 0.3127f, y = 0.3290f;
+          if (!esphome_hue_ent_color(&bri, &x, &y)) return;
+          float r = 1, g = 1, b = 1;
+          if (y > 0.001f) {
+            r = zigbee::get_r_from_xy(x, y);
+            g = zigbee::get_g_from_xy(x, y);
+            b = zigbee::get_b_from_xy(x, y);
+          }
+          r = r < 0 ? 0 : r; g = g < 0 ? 0 : g; b = b < 0 ? 0 : b;
+          const float m = r > g ? (r > b ? r : b) : (g > b ? g : b);
+          if (m > 0.0001f) { r /= m; g /= m; b /= m; }
+          const float k = 0.5f;  // suavitzat entre trames (~23 per segon)
+          id(amb_r) += (r * bri - id(amb_r)) * k;
+          id(amb_g) += (g * bri - id(amb_g)) * k;
+          id(amb_b) += (b * bri - id(amb_b)) * k;
+          id(amb_bri) += (bri - id(amb_bri)) * k;
+          if (!id(amb_active)) {
+            id(amb_active) = true;
+            ESP_LOGI("ambilight", "Ambilight ON: el cos i el pot segueixen la TV");
+            for (auto *l : {id(cactus_tronc), id(cactus_brac_adalt), id(cactus_brac_abaix)}) {
+              auto c = l->turn_off(); c.set_transition_length(0); c.perform();
+            }
+            if (id(strip_tronc).current_values.is_on()) { auto c = id(strip_tronc).turn_off(); c.set_transition_length(0); c.perform(); }
+            if (id(strip_brac).current_values.is_on()) { auto c = id(strip_brac).turn_off(); c.set_transition_length(0); c.perform(); }
+            auto p = id(planta).turn_on(); p.set_brightness(1.0f); p.set_transition_length(0); p.set_effect("Ambilight"); p.perform();
+            auto t = id(cactus_test).turn_on(); t.set_brightness(1.0f); t.set_transition_length(0); t.set_effect("Ambilight Pot"); t.perform();
+          }

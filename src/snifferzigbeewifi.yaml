@@ -1,0 +1,359 @@
+# snifferzigbeewifi.yaml - zigbeelogger.yaml amb la finestra Wi-Fi "com les llums" (2026-10-11).
+# Diferencies amb zigbeelogger.yaml:
+#   - activa la coexistencia Wi-Fi / 802.15.4 a l'arrencada (esp_coex_wifi_i154_enable(), coex_extern.h), com fan
+#     cactushue i la Lola abans que el Wi-Fi comenci a escanejar: zigbeelogger no ho feia i a cada arrencada deia
+#     "No networks found" mentre el cactus, al costat, connectava a la primera;
+#   - xarxes com les llums: wifi_ssid (prioritat 2) i wifi_ssid_b (1);
+#   - directori de build propi (alternar amb zigbeelogger.yaml no obliga a recompilar-ho tot).
+# Mateix 'name' (zigbeelogger): mateixos temes MQTT (cmd/nwk_key, cmd/channel...) i mateixa IP/hostname.
+
+# zigbeelogger.yaml — ESP32-C6 "sniffer" Zigbee / IEEE 802.15.4 que treu TOTES les trames del canal pel port serie.
+#
+# Cicle de vida a cada arranc:
+#   1. Finestra Wi-Fi de ${wifi_window} (30 s): es connecta al Wi-Fi, a l'API nativa i a UN sol MQTT (broker local en
+#      clar: secrets mqttbrokerlocal / mqttusername / mqttpassword). Serveix per fer OTA, canviar el canal (number
+#      "Zigbee Channel", persistit) o dir-li que es quedi en Wi-Fi.
+#   2. Passats els 30 s: apaga el Wi-Fi (la radio 2.4 GHz queda lliure), engega el driver 802.15.4 cru de l'IDF en
+#      mode PROMISCU al canal ${zigbee_channel} i logueja cada trama rebuda pel serie (zbsniffer.h): MAC + NWK
+#      Zigbee (+ APS si la NWK va en clar) + hex. Cada segon, un resum de trames/s i perdudes.
+#   Boto BOOT: durant la finestra -> es queda en Wi-Fi (no arranca el sniffer); amb el sniffer en marxa -> reinicia
+#   (torna a la finestra Wi-Fi). El sniffer no transmet mai (ni ACKs): identitat MAC que no casa amb cap trama.
+#
+# Sense pila Zigbee: no cal component extern, nomes CONFIG_IEEE802154_ENABLED i el header zbsniffer.h.
+#
+# DESXIFRAT: amb la clau de xarxa Zigbee (16 bytes, 32 digits hex) el sniffer desxifra les trames NWK i
+# decodifica NWK/APS/ZDO/ZCL (l'entrevista del pont, lectures d'atributs, Mgmt_Leave...). Com obtenir-la: el cactus
+# (cactushue.yaml, `log_network_key: true`) la imprimeix al seu log en unir-se a la xarxa Hue. Com entrar-la
+# (durant la finestra Wi-Fi; es desa a la flash i s'aplica en arrancar el sniffer):
+#   - accio d'API "set_nwk_key" (Home Assistant > Eines de desenvolupador > Accions), o
+#   - MQTT: ${esphome_topic_prefix}/cmd/nwk_key amb la clau en text pla, o
+#   - substitucio nwk_key (compilada; nomes s'usa si no n'hi ha cap de desada). Buit = sense desxifrat.
+# La clau no es publica per MQTT ni a HA (entitat interna) i al log nomes en surt una empremta.
+
+substitutions:
+  name: zigbeelogger
+  friendly_name: Zigbee Logger
+  wifi_window: "30s"          # finestra Wi-Fi/API/MQTT abans de passar a sniffer
+  zigbee_channel: "11"        # canal 802.15.4 per defecte (11..26); el number "Zigbee Channel" (persistit) mana
+  log_hex: "true"             # true = afegeix el volcat hex complet de cada trama a la linia de log
+  nwk_key: ""                 # clau de xarxa Zigbee per desxifrar (32 hex); millor entrar-la per API/MQTT
+  esphome_topic_prefix: esphome/${name}
+  discovery_prefix: homeassistant
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  comment: "Sniffer 802.15.4/Zigbee pel serie: finestra Wi-Fi ${wifi_window} i despres canal ${zigbee_channel} promiscu."
+  build_path: .esphome/build/snifferzigbeewifi
+  includes:
+    - zbsniffer.h
+    - coex_extern.h
+  on_boot:
+    # Coexistencia Wi-Fi / 802.15.4 abans que el Wi-Fi escanegi (com cactushue / Lola).
+    - priority: 800
+      then:
+        - lambda: |-
+            int r = esp_coex_wifi_i154_enable();
+            ESP_LOGI("coex_early", "esp_coex_wifi_i154_enable() -> %d", r);
+    - priority: -100
+      then:
+        - script.execute: wifi_window_then_sniff
+
+esp32:
+  board: esp32-c6-devkitc-1
+  variant: esp32c6
+  flash_size: 4MB
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESPTOOLPY_FLASHSIZE_4MB: y
+      CONFIG_IEEE802154_ENABLED: y          # driver de radio 802.15.4 cru (components/ieee802154)
+      CONFIG_IEEE802154_RX_BUFFER_SIZE: "50" # buffers de recepcio del driver (per defecte 20)
+      CONFIG_ESP_TASK_WDT_TIMEOUT_S: "25"
+
+# El devkit C6 treu el log per USB Serial/JTAG (el baud es indiferent). Amb un UART extern, 921600 evita perdre linies
+# en canals carregats: cada trama es una linia de fins a ~500 caracters.
+logger:
+  baud_rate: 921600
+  # 1024: una trama de 127 bytes son ~380 caracters d hex + ~350 de decodificacio; amb 512 (defecte) el hex es
+  # tallava i no es podia desxifrar el Transport Key.
+  tx_buffer_size: 1024
+  level: INFO
+  logs:
+    zbsniff: INFO
+    wifi: INFO
+    mqtt: INFO
+    api: WARN
+    component: WARN
+    sensor: WARN
+    number: WARN
+    switch: WARN
+    button: WARN
+    binary_sensor: WARN
+
+api:
+  reboot_timeout: 0s
+  actions:
+    - action: start_sniffer_now
+      then:
+        - script.execute: switch_to_sniffer
+    - action: stay_on_wifi
+      then:
+        - lambda: id(stay_wifi) = true;
+        - logger.log: "API: em quedo en Wi-Fi, el sniffer no arrancara fins al proper reinici"
+    # Clau de xarxa Zigbee (32 hex) per desxifrar; es desa a la flash. Buit = esborrar-la.
+    - action: set_nwk_key
+      variables:
+        key: string
+      then:
+        - lambda: |-
+            auto c = id(txt_nwk_key).make_call();
+            c.set_value(key);
+            c.perform();
+            ESP_LOGI("zbsniff", "API: clau de xarxa desada (%u caracters); s'aplica en arrancar el sniffer", (unsigned) key.size());
+
+ota:
+  - platform: esphome
+    on_begin:
+      then:
+        - lambda: id(ota_active) = true;
+        - logger.log: "OTA iniciat: la finestra Wi-Fi s'allarga"
+    on_error:
+      then:
+        - lambda: id(ota_active) = false;
+        - logger.log: "OTA fallit: passo a sniffer"
+        - script.execute: switch_to_sniffer
+
+wifi:
+  min_auth_mode: WPA2
+  networks:
+    - ssid: !secret wifi_ssid
+      password: !secret wifi_password
+      priority: 2
+    - ssid: !secret wifi_ssid_b
+      password: !secret wifi_password
+      priority: 1
+  power_save_mode: NONE
+  reboot_timeout: 0s
+  output_power: 20dB
+  on_connect:
+    - logger.log:
+        format: "Wi-Fi connectat: finestra de ${wifi_window} per API/MQTT/OTA (BOOT = quedar-se en Wi-Fi)"
+        level: INFO
+
+# Un sol MQTT: broker LOCAL en clar (secrets.yaml). Nomes viu durant la finestra Wi-Fi.
+mqtt:
+  broker: !secret mqttbrokerlocal
+  port: 1883
+  username: !secret mqttusername
+  password: !secret mqttpassword
+  topic_prefix: ${esphome_topic_prefix}
+  discovery_prefix: ${discovery_prefix}
+  discovery: true
+  reboot_timeout: 0s
+  birth_message:
+    topic: ${esphome_topic_prefix}/status
+    payload: online
+  will_message:
+    topic: ${esphome_topic_prefix}/status
+    payload: offline
+  on_message:
+    # Canal en text pla (11..26): s'aplica al number persistit -> el sniffer l'agafa en arrancar.
+    - topic: ${esphome_topic_prefix}/cmd/channel
+      then:
+        - lambda: |-
+            int ch = atoi(x.c_str());
+            if (ch < 11 || ch > 26) { ESP_LOGW("zbsniff", "cmd/channel: '%s' fora de 11..26", x.c_str()); return; }
+            auto c = id(num_channel).make_call();
+            c.set_value((float) ch);
+            c.perform();
+    # Qualsevol payload: arrenca el sniffer ara mateix (tanca el Wi-Fi).
+    - topic: ${esphome_topic_prefix}/cmd/sniff
+      then:
+        - script.execute: switch_to_sniffer
+    # Qualsevol payload: es queda en Wi-Fi (no arrenca el sniffer fins al proper reinici).
+    - topic: ${esphome_topic_prefix}/cmd/stay_wifi
+      then:
+        - lambda: id(stay_wifi) = true;
+        - logger.log: "MQTT: em quedo en Wi-Fi"
+    # Clau de xarxa Zigbee en text pla (32 hex); es desa a la flash. No es publica enlloc.
+    - topic: ${esphome_topic_prefix}/cmd/nwk_key
+      then:
+        - lambda: |-
+            auto c = id(txt_nwk_key).make_call();
+            c.set_value(x);
+            c.perform();
+            ESP_LOGI("zbsniff", "MQTT: clau de xarxa desada (%u caracters); s'aplica en arrancar el sniffer", (unsigned) x.size());
+
+globals:
+  - id: stay_wifi
+    type: bool
+    initial_value: "false"
+  - id: ota_active
+    type: bool
+    initial_value: "false"
+  - id: sniffing
+    type: bool
+    initial_value: "false"
+
+number:
+  - platform: template
+    name: "Zigbee Channel"
+    id: num_channel
+    icon: mdi:zigbee
+    min_value: 11
+    max_value: 26
+    step: 1
+    initial_value: ${zigbee_channel}
+    optimistic: true
+    restore_value: true
+    mode: box
+    entity_category: config
+
+switch:
+  - platform: template
+    name: "Log hex dump"
+    id: sw_hex
+    icon: mdi:hexadecimal
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    entity_category: config
+    turn_on_action:
+      - lambda: zbsniff::st.hex = true;
+    turn_off_action:
+      - lambda: zbsniff::st.hex = false;
+  - platform: template
+    name: "Stay on WiFi (skip sniffer)"
+    id: sw_stay_wifi
+    icon: mdi:wifi
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    entity_category: config
+    turn_on_action:
+      - lambda: id(stay_wifi) = true;
+    turn_off_action:
+      - lambda: id(stay_wifi) = false;
+
+button:
+  - platform: template
+    name: "Start sniffer now"
+    icon: mdi:radio-tower
+    on_press:
+      - script.execute: switch_to_sniffer
+  - platform: restart
+    name: "Restart (WiFi window)"
+    icon: mdi:restart
+
+# Clau de xarxa per al desxifrat: interna (ni HA ni MQTT la veuen) i persistida a la flash.
+text:
+  - platform: template
+    id: txt_nwk_key
+    name: "Zigbee NWK key"
+    internal: true
+    optimistic: true
+    restore_value: true
+    initial_value: "${nwk_key}"
+    min_length: 0
+    max_length: 64
+    mode: password
+
+binary_sensor:
+  # BOOT (GPIO9): finestra Wi-Fi -> quedar-se en Wi-Fi; sniffer en marxa -> reiniciar (torna a la finestra Wi-Fi).
+  - platform: gpio
+    name: "Boot Button"
+    pin:
+      number: GPIO9
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    filters:
+      - delayed_on: 50ms
+    on_press:
+      - if:
+          condition:
+            lambda: return id(sniffing);
+          then:
+            - logger.log: "BOOT amb sniffer en marxa: reinici (finestra Wi-Fi)"
+            - delay: 200ms
+            - lambda: App.safe_reboot();
+          else:
+            - lambda: id(stay_wifi) = true;
+            - logger.log: "BOOT durant la finestra: em quedo en Wi-Fi (el sniffer no arrancara)"
+
+sensor:
+  - platform: template
+    name: "Sniffed frames"
+    icon: mdi:counter
+    update_interval: 5s
+    accuracy_decimals: 0
+    lambda: return (float) zbsniff::g_received;
+  - platform: template
+    name: "Dropped frames"
+    icon: mdi:alert
+    update_interval: 5s
+    accuracy_decimals: 0
+    lambda: return (float) zbsniff::g_dropped;
+
+text_sensor:
+  - platform: template
+    name: "Mode"
+    update_interval: 5s
+    lambda: |-
+      if (zbsniff::st.running) return std::string("sniffer ch") + std::to_string(zbsniff::st.channel);
+      return std::string(id(stay_wifi) ? "wifi (stay)" : "wifi window");
+
+script:
+  # Finestra Wi-Fi: passat el temps, si ningu ha demanat quedar-se (BOOT / switch / API / MQTT) ni hi ha OTA, sniffer.
+  - id: wifi_window_then_sniff
+    mode: single
+    then:
+      # La finestra compta des que connecta (no des de l'arrencada): en reiniciar, el router sol rebutjar els primers
+      # intents ("Association comeback time too long", PMF) i la connexio pot trigar ~25 s. Maxim 40 s esperant.
+      - wait_until:
+          condition:
+            wifi.connected:
+          timeout: 40s
+      - delay: ${wifi_window}
+      - if:
+          condition:
+            lambda: return id(stay_wifi) || id(sw_stay_wifi).state;
+          then:
+            - logger.log: "Finestra acabada: em quedo en Wi-Fi (stay_wifi)"
+          else:
+            - if:
+                condition:
+                  lambda: return id(ota_active);
+                then:
+                  - logger.log: "Finestra acabada pero OTA en curs: espero"
+                else:
+                  - script.execute: switch_to_sniffer
+
+  # Apaga el Wi-Fi (API/MQTT cauen) i engega el sniffer al canal del number. Nomes una vegada per arranc.
+  - id: switch_to_sniffer
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: return id(sniffing);
+          then:
+            - logger.log: "sniffer ja en marxa"
+          else:
+            - logger.log: "Fi de la finestra Wi-Fi: apago Wi-Fi i arranco el sniffer 802.15.4"
+            - lambda: id(sniffing) = true;
+            - wifi.disable:
+            - delay: 2s
+            - lambda: |-
+                uint8_t ch = (uint8_t) id(num_channel).state;
+                if (ch < 11 || ch > 26) ch = ${zigbee_channel};
+                zbsniff::set_key_hex(id(txt_nwk_key).state);
+                if (!zbsniff::start(ch, id(sw_hex).state)) id(sniffing) = false;
+
+interval:
+  # Buida l'anell de trames (la ISR nomes copia; aqui es decodifica i es logueja).
+  - interval: 5ms
+    then:
+      - lambda: zbsniff::drain();
+  - interval: 1s
+    then:
+      - lambda: zbsniff::stats();
